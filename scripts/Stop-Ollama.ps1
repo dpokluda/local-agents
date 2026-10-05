@@ -17,7 +17,7 @@
     ./scripts/Stop-Ollama.ps1 -WhatIf
 #>
 [CmdletBinding(SupportsShouldProcess)]
-param()
+param([string]$BaseUrl)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -25,4 +25,8 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/_common.ps1"
 
 Write-Step 'Stopping Ollama service'
-Stop-OllamaService
+if (-not $BaseUrl -and -not $env:OLLAMA_HOST) {
+    $saved = Get-SavedOllamaEnvironment
+    if ($saved.Contains('OLLAMA_HOST')) { $BaseUrl = $saved['OLLAMA_HOST'] }
+}
+Stop-OllamaService -BaseUrl (Resolve-LocalAgentBaseUrl $BaseUrl)

@@ -17,13 +17,14 @@ Prerequisite: Homebrew at `/opt/homebrew`. These scripts will not install Homebr
 ./scripts/Install-LocalAgents.ps1
 ```
 
-This is idempotent — every step checks state first, so re-running is a no-op. It:
+Already installed? Follow the [no-redownload update steps](../README.md#already-installed-apply-the-script-fixes-without-downloading-models).
+The installer checks existing state before installing packages. It:
 
 1. Verifies the host is macOS on Apple Silicon and reports your memory budget.
 2. Verifies Homebrew is present.
 3. `brew install ollama` (skipped if already installed).
 4. `brew services run ollama` — starts the server **now, without** registering it to
-   launch at every login (skipped if the API already answers).
+   launch at every login (skipped if the API already answers unless `-AtLogin` is requested).
 5. Polls `http://localhost:11434/api/version` until the server responds.
 
 On-demand is the default on purpose. If you want Ollama always available after a reboot:
@@ -108,8 +109,10 @@ them.
 | `OLLAMA_KEEP_ALIVE` | `-1` | `-KeepAlive` | Keeps weights resident **until the server stops or you unload them**. Without it, an agent that pauses between tool round-trips pays a full cold reload — tens of seconds for a 19 GB model, repeatedly. |
 | `OLLAMA_MAX_LOADED_MODELS` | `1` | `-MaxLoadedModels` | Only one model resident at a time. Loading a second one evicts the first instead of stacking. |
 
-The defaults live in **`scripts/_common.ps1`**, in one `$LocalAgentDefaults` block. Change
-them there and every script picks it up; there is nowhere else for them to drift.
+Initial defaults live in **`scripts/_common.ps1`**. Start/restart saves the chosen settings
+in a service plist. Later omitted parameters reuse those saved values; pass explicit
+parameters to change them. Use `-ContextLength 0` or `-MaxLoadedModels 0` to clear those
+overrides.
 
 **Why keep-alive is `-1`.** The lifecycle here is **explicit**, not timed. You start the
 server when you intend to use it and stop it when you are done, so a coffee break or a long
@@ -141,16 +144,16 @@ with roughly 15 GB for everything else. With the cap at 1, loading a different m
 out the current one. Raise it with `-MaxLoadedModels 2` if you deliberately want two
 resident and have checked the budget.
 
-**Ollama's own default is 5 minutes**, and that is what you get if you start the server
-yourself (`brew services run ollama`, `ollama serve`) or pass `-NoEnvironment` — these
-settings only exist because the scripts apply them.
+**Ollama's own keep-alive default is 5 minutes** when no override is supplied.
+`-NoEnvironment` means **reuse configuration without rewriting it**, not reset to
+Ollama's defaults. If a saved plist exists, it is still used.
 
 A fourth knob is **not** set by default because it costs real memory, but you will likely
 need it for agent harnesses:
 
 | Variable | Value | Parameter | Why |
 |---|---|---|---|
-| `OLLAMA_CONTEXT_LENGTH` | e.g. `65536` | `-ContextLength` | Ollama's default `num_ctx` is far below what the model supports. Agent harnesses need a large window — Ollama's Copilot CLI page recommends ≥64k, GitHub's BYOK page ≥128k. On 48 GB, 64k is the practical floor and 128k is reachable if your budget absorbs it. The cost is KV cache RAM, which is exactly why `OLLAMA_KV_CACHE_TYPE=q8_0` above matters. Set it deliberately, then re-check your budget in [models.md](models.md). |
+| `OLLAMA_CONTEXT_LENGTH` | e.g. `65536` | `-ContextLength` | Defaults vary with runtime/backend and available memory. Choose a window explicitly for agents; Ollama recommends at least 64k and GitHub recommends 128k. More context costs memory. Start at 65536 on a 48 GB Mac and verify the allocation with `Test-LocalStack.ps1 -MinimumContextLength 65536`. |
 
 ```powershell
 # At startup
@@ -169,15 +172,24 @@ inherit your shell environment. Setting `$env:OLLAMA_KEEP_ALIVE` in a terminal �
 profile — changes **nothing** about the server's behaviour. This is the single most common
 way people conclude the knobs "don't work."
 
-`launchctl setenv` is the mechanism that does work, and it is what
-`Start-Ollama.ps1` / `Restart-Ollama.ps1` use. You get it for free by using them.
+The scripts now write **`~/Library/Application Support/local-agents/ollama.plist`** and
+pass it to `brew services run/start ollama --file=...`. This file contains the actual
+`EnvironmentVariables` used by the process, so it overrides Homebrew's formula defaults.
+It references Homebrew's stable `opt` executable path, not the repository or a particular
+Cellar version.
 
-Two things worth knowing about it:
+With **`-AtLogin`**, Homebrew registers a copy in your LaunchAgents directory. The saved
+values therefore survive reboot without PowerShell or this checkout running at login.
+Without `-AtLogin`, the configuration persists but startup remains on demand.
+Registering an already-running on-demand service requires a brief stop/start; the scripts
+do this deliberately because `brew services start` otherwise skips a running service.
 
-- **`launchctl setenv` values last until reboot**, not forever. That is fine here, because
-  the scripts re-apply them on every start. If you start the service some other way
-  (`brew services run ollama` by hand, say) after a reboot, the knobs will be missing.
-- **It is machine-wide**, not per-shell.
+The old scripts used `launchctl setenv`. Those values were transient, and conflicting
+plist values took precedence. A normal start/restart clears only the five old tuning keys
+after saving the replacement configuration. Existing `OLLAMA_MODELS` values observed in
+the server environment (or its launchctl fallback) are preserved in the plist, including
+paths with spaces. Keep using these scripts after Homebrew upgrades so startup continues
+to use the custom file; a manual `brew services restart ollama` can restore formula defaults.
 
 Confirm what the server actually picked up:
 
@@ -185,38 +197,10 @@ Confirm what the server actually picked up:
 ./scripts/Test-LocalStack.ps1 -SkipBenchmark -SkipToolCheck
 ```
 
-That check reads the **server process's own environment** (via `ps eww` on the server PID,
-falling back to `launchctl getenv`), not your shell's. It labels which source it used. This
-distinction matters: your shell's `$env:OLLAMA_*` tells you nothing about a launchd-managed
-server, so a check that reads it will happily report success while the server runs on
-defaults.
-
-A typical first run looks like this, on a server started before the knobs were applied:
-
-```
-==> Environment knobs
-    source: server process (pid 14886)
-    OK  OLLAMA_FLASH_ATTENTION=1
-    OK  OLLAMA_KV_CACHE_TYPE=q8_0
-    --  OLLAMA_KEEP_ALIVE not set (suggested: -1)
-    --  OLLAMA_MAX_LOADED_MODELS not set (suggested: 1)
-```
-
-#### Why two of them were already set
-
-Homebrew's own service plist sets `OLLAMA_FLASH_ATTENTION` and `OLLAMA_KV_CACHE_TYPE` in its
-`EnvironmentVariables` block. Those two arrive whether or not you ran our scripts — which is
-why they show as `OK` above while keep-alive and the model cap do not.
-
-One consequence is worth flagging honestly, because it is **unverified**: where a plist's
-`EnvironmentVariables` and a `launchctl setenv` value overlap, the **plist wins**. Whether
-`launchctl setenv` reaches a `brew services` LaunchAgent at all has not been confirmed here.
-For the two knobs Homebrew already sets, this is moot — its values match ours. For
-`OLLAMA_KEEP_ALIVE`, `OLLAMA_MAX_LOADED_MODELS` and `OLLAMA_CONTEXT_LENGTH`, which Homebrew
-does not set, there is nothing to conflict with.
-
-Rather than trust either theory, run the check above after a `./scripts/Restart-Ollama.ps1`.
-It reports what the server *actually* has, which settles it on your machine.
+The check prefers the **server process's environment** (`ps eww`) and labels its source.
+A `launchctl getenv` fallback is only a hint, not proof of what a running process inherited.
+Environment inspection is advisory; it is unavailable for remote/non-Mac endpoints.
+To check a model's actual allocated window, use `-MinimumContextLength` after inference.
 
 The alternative, if you prefer not to touch launchd: stop the service and run the server in
 the foreground, where it does inherit your shell environment.
@@ -249,12 +233,18 @@ Tiers are defined in [`models.json`](../models.json) and explained in [models.md
 ./scripts/Sync-Models.ps1 -Tag 'gpt-oss:20b'     # one specific model
 ```
 
-Already-present models are skipped, so re-running after editing `models.json` only pulls
-the delta. To also remove models that are no longer in the tier:
+Already-present tags are skipped; rerunning does not refresh their weights. Explicit tags
+with unknown sizes are supported, but excluded from size totals. All reads, downloads,
+and deletions use the same `-BaseUrl` (or `OLLAMA_HOST`).
+To also remove models that are no longer in the tier:
 
 ```powershell
 ./scripts/Sync-Models.ps1 -Tier recommended -Prune -WhatIf
 ```
+
+Without `-WhatIf`, pruning asks for confirmation for each extra model. Use
+`-Confirm:$false` only when deliberately approving all deletions. Pruning will not run if
+the desired replacement models are missing after downloads.
 
 ---
 
@@ -265,24 +255,25 @@ the delta. To also remove models that are no longer in the tier:
 ```
 
 This is the script that earns its keep. Per installed model it reports throughput
-(tokens/sec, taken from Ollama's own eval counters rather than wall clock), cold-load time,
-and — critically — whether **tool-calling actually works**, on both the native API and the
-OpenAI-compatible `/v1` endpoint.
+(tokens/sec, taken from Ollama's own eval counters rather than wall clock), load duration,
+and native tool-call shape. It also reassembles streamed tool calls from
+`/v1/chat/completions`, submits a synthetic tool result, and checks the final reply.
+This is a bounded smoke test, not a long-context evaluation or a Responses API test.
 
 Tool-calling is checked separately because its failure mode is silent. A model that ignores
 tool definitions does not error; it writes a friendly paragraph *about* calling the tool,
 the harness gets no `tool_calls` array, and the agent loop quietly stalls. You want to find
 that out from a health check, not from an agent that has been spinning for ten minutes.
 
-The script exits non-zero if any model fails a tool check, so it works in a pre-flight
-script or a cron job.
+The script exits non-zero if any requested benchmark, tool, context, or unload check fails,
+including benchmark-only runs. Skips are not counted as successful inference.
 
 ```powershell
 # Memory-friendly sweep of a large tier, with results saved for comparison over time
 ./scripts/Test-LocalStack.ps1 -UnloadAfterEach -JsonPath ./out/stack-check.json
 
 # Just one model
-./scripts/Test-LocalStack.ps1 -Model 'qwen3-coder:30b'
+./scripts/Test-LocalStack.ps1 -Model 'qwen3-coder:30b' -MinimumContextLength 65536
 ```
 
 ---
@@ -306,7 +297,7 @@ RAM and uses essentially no CPU. It is a socket waiting for a request.
 for as long as `OLLAMA_KEEP_ALIVE` says. This repo sets `-1`, so **it stays until you stop
 the server or unload it**; that is deliberate, because starting the server is how you say
 "I am using this." Ollama's own default is 5 minutes, which is what applies if you start
-the server without these scripts or with `-NoEnvironment`.
+the server without any keep-alive override. `-NoEnvironment` preserves existing settings.
 
 So there are three reasonable postures:
 
@@ -363,20 +354,19 @@ removing it leaves tens of gigabytes behind.
 Nothing in this repo was ever added to your `$PROFILE`, so there is nothing to unwind
 there. Delete the repo directory when you are done with it.
 
-One loose end: `launchctl setenv` values set by `Start-Ollama.ps1` persist until your next
-reboot. They are harmless with Ollama gone, but `launchctl unsetenv OLLAMA_KEEP_ALIVE`
-(and friends) clears them if you want a spotless machine.
+The uninstaller also offers to remove the saved service plist. It leaves diagnostic logs
+and any custom `OLLAMA_MODELS` directory alone, reporting the latter for manual handling.
 
 ---
 
 ## Troubleshooting
 
 **`Test-LocalStack.ps1` says the server is unreachable.**
-`brew services list` to check state; logs are under `~/Library/Logs/Homebrew/ollama/`.
+`brew services list` to check state; custom-service logs are at `~/Library/Logs/local-agents/ollama.log`.
 Try `./scripts/Stop-Ollama.ps1` then `ollama serve` in the foreground to see errors directly.
 
 **Generation is inexplicably slow (single-digit tokens/sec on a big machine).**
-You are almost certainly swapping. Check resident models with
+Possible causes include memory pressure, CPU offload, prompt processing, or throttling. Check resident models with
 `./scripts/Get-OllamaStatus.ps1` and compare the total against
 `./scripts/Get-LocalAgentBudget.ps1`. Free memory with `./scripts/Dismount-LocalModel.ps1`,
 or sweep a whole tier with `./scripts/Test-LocalStack.ps1 -UnloadAfterEach`.
@@ -399,11 +389,12 @@ json: cannot unmarshal object into Go struct field .tools of type api.Tools
 means `tools` was sent as a JSON object instead of an array.
 
 **The knobs do not seem to apply.**
-You set them in the shell but the service runs under launchd, which never saw them. Run
+The service runs under launchd, not your shell. Run
 `./scripts/Restart-Ollama.ps1`, then confirm with `./scripts/Test-LocalStack.ps1
 -SkipBenchmark -SkipToolCheck`, which reads the server process rather than your shell.
 See section 3.
 
 **Installed, but the server is on a 5-minute keep-alive.**
-The knobs are applied to launchd *before* the service starts, so a server that was already
-running when you installed never saw them. `./scripts/Restart-Ollama.ps1` fixes it.
+An already-running server does not read a changed plist. `./scripts/Restart-Ollama.ps1`
+applies the saved values. Native API requests with their own `keep_alive` override the
+server default for that model.

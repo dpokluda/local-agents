@@ -18,24 +18,25 @@
     ./scripts/Get-LocalAgentBudget.ps1
 #>
 [CmdletBinding()]
-param()
+param([string]$ManifestPath = (Join-Path $PSScriptRoot '..' 'models.json'))
 
 Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
+if (-not $IsMacOS) { throw 'This budget is for Apple unified memory, not PC system RAM or dedicated VRAM.' }
 $totalGb = [math]::Round([int64](& sysctl -n hw.memsize) / 1GB, 0)
+if ($LASTEXITCODE -ne 0 -or $totalGb -le 0) { throw 'Could not read unified memory from sysctl.' }
 $reservedGb = [math]::Round([math]::Max(8, $totalGb * 0.29), 0)
 $budgetGb = [math]::Max(0, $totalGb - $reservedGb)
+$manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+$fits = @($manifest.models | Where-Object {
+    $null -ne $_.size_gb -and ([double]$_.size_gb * 1e9) -le ($budgetGb * 1GB)
+} | ForEach-Object { $_.tag })
 
 [pscustomobject]@{
     UnifiedMemoryGb   = $totalGb
     ReservedGb        = $reservedGb
     WeightBudgetGb    = $budgetGb
-    ComfortableModels = switch ($budgetGb) {
-        { $_ -ge 80 } { 'everything in models.json, plus the 65-75GB tier (gpt-oss:120b, devstral-2)'; break }
-        { $_ -ge 45 } { 'everything in models.json with room to spare; the 52GB+ tier is still out of reach'; break }
-        { $_ -ge 30 } { 'everything in models.json (largest is qwen3-coder:30b at 19GB)'; break }
-        { $_ -ge 14 } { 'gpt-oss:20b, devstral-small-2:24b, gemma4:26b, gemma4:e4b'; break }
-        { $_ -ge 8 } { 'gemma4:e4b only'; break }
-        default { 'too little headroom for comfortable agent work'; break }
-    }
+    ComfortableModels = if ($fits.Count) { $fits -join ', ' } else { 'no manifest models fit the estimated budget' }
+    Note              = 'Memory fields are GiB; model sizes are estimates, not a load test. Context and backend overhead still matter.'
 }

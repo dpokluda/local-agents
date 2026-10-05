@@ -41,5 +41,5 @@ if ($models.Count -eq 0) {
 
 $models | Sort-Object name | Select-Object `
 @{ L = 'Model'; E = { $_.name } },
-@{ L = 'Size(GB)'; E = { [math]::Round($_.size / 1GB, 1) } },
+@{ L = 'Size(GB)'; E = { [math]::Round($_.size / 1e9, 1) } },
 @{ L = 'Modified'; E = { $_.modified_at } }

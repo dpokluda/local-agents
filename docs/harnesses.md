@@ -192,11 +192,12 @@ conservative defaults** — which may be well below what your model can actually
 the limit yourself to match your configured context length:
 
 ```powershell
-$env:OLLAMA_CONTEXT_LENGTH            = '65536'
+./scripts/Restart-Ollama.ps1 -ContextLength 65536
 $env:COPILOT_PROVIDER_MAX_PROMPT_TOKENS = '60000'   # leave room for the response
+$env:COPILOT_PROVIDER_MAX_OUTPUT_TOKENS = '4096'
 ```
 
-`./scripts/Start-LocalCopilot.ps1 -MaxPromptTokens 60000` does the same thing for a single
+`./scripts/Start-LocalCopilot.ps1 -MaxPromptTokens 60000 -MaxOutputTokens 4096` does the same thing for a single
 session, without touching your shell environment.
 
 ### Model requirements — read this before picking a model
@@ -204,8 +205,9 @@ session, without touching your shell environment.
 Copilot CLI requires a model that supports **tool calling and streaming**. If the model
 lacks either, the CLI returns an error rather than degrading gracefully.
 
-This is exactly what [`Test-LocalStack.ps1`](../scripts/Test-LocalStack.ps1) checks. Run it
-against your intended model first and confirm the `Tools/v1` column says `pass`:
+[`Test-LocalStack.ps1`](../scripts/Test-LocalStack.ps1) checks native tool-call shape plus
+a streamed Chat Completions tool call and synthetic tool-result continuation. Confirm
+the `Tools/v1` column says `pass`; this does not test the Responses API or long-session quality:
 
 ```powershell
 ./scripts/Test-LocalStack.ps1 -Model 'qwen3-coder:30b'
@@ -225,8 +227,8 @@ better if your RAM budget absorbs it. The difference is not free — KV cache sc
 context, so a 128k window costs gigabytes on top of the weights. Run the numbers in
 [models.md](models.md) before assuming a 19 GB model plus a full 128k context still fits.
 
-The catch: **Ollama's default `num_ctx` is far smaller than the model's maximum** — a few
-thousand tokens. The model *can* do 128k; Ollama just is not offering it. The symptom is an
+The catch: **Ollama's default `num_ctx` varies by runtime and available memory** and may differ from
+the window you intended. The symptom of an undersized window is an
 agent that mysteriously forgets the start of the session.
 
 Raise it server-wide:

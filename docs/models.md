@@ -5,6 +5,11 @@ Tags churn fast — a model that exists today may be renamed, re-quantized, or s
 within weeks. Re-check before trusting any size below. The authoritative machine-readable
 copy of this list is [`../models.json`](../models.json); this page is the prose version.
 
+Sizes below are historical decimal-GB planning estimates, not pinned artifacts. A tag can
+resolve to different formats or sizes as the library/runtime changes; inspect installed
+bytes with `Get-LocalModel.ps1`. Memory-budget fields use GiB (PowerShell's `1GB`), and the
+budget script converts model estimates before comparing them.
+
 ---
 
 ## The RAM budget, honestly
@@ -39,9 +44,9 @@ Two things this table does *not* mean:
 
 - **It is not a disk budget.** The `full` tier is ~107 GB on disk but you never hold all
   seven resident. Disk is cheap; RAM is the constraint.
-- **It is not a "will it load" test.** A model slightly over budget will still load — macOS
-  will swap, and throughput collapses from tens of tokens/sec to single digits. Nothing
-  errors out. It just gets unusably slow, which is a worse failure than a clean refusal.
+- **It is not a "will it load" test.** An oversized allocation may fail outright, trigger
+  CPU offload, or create memory pressure and severe slowdown. GPU-wired allocations are
+  not ordinary pageable RAM. Inspect the actual loaded model and memory pressure.
 
 **One model at a time, by default.** The budget column is what you can hold *in total*, and
 two models will happily sit inside it: `qwen3-coder:30b` (19 GB) plus `gpt-oss:20b` (14 GB)
@@ -91,18 +96,19 @@ Listed explicitly because these come up constantly and the answer is a flat no:
 
 ## Quantization
 
-Quantization shrinks weights by storing them at lower precision. Ollama's default tag is
-`q4_K_M` and that default is correct — this is one of the few cases where the obvious
-choice is also the right one.
+Quantization shrinks weights by storing them at lower precision. Q4_K_M is a useful
+starting point for GGUF models, not an Ollama-wide default. `gpt-oss:20b` uses MXFP4;
+the MLX alternatives listed here are safetensors/NVFP4. Check the exact artifact rather
+than assuming that every tag uses the same format.
 
 | Scheme | Relative size | Verdict |
 |---|---|---|
-| `q4_K_M` | 1.0× (baseline) | **Use this.** Best size/quality tradeoff by a wide margin. All sizes in this repo assume it. |
-| `q8_0` | ~2× | Roughly double the RAM for a marginal quality gain. Doubling your memory footprint to maybe win a few percent is a bad trade when the alternative is running a *bigger* model at q4. |
-| `bf16` | ~3× | Full precision. Worth it for fine-tuning or evaluation work; not worth it for running agents locally. |
+| `q4_K_M` | 1.0× (baseline) | Useful GGUF size/quality starting point. |
+| `q8_0` | roughly 2× | More weight memory, potentially better precision; measure on your task. |
+| `bf16` | roughly 3–4× | Much larger weights; exact ratios depend on tensor mix and metadata. |
 
-The practical rule: **a bigger model at `q4_K_M` beats a smaller model at `q8_0`** at equal
-memory. Spend your RAM on parameters, not precision.
+At a fixed memory budget, compare both model size and quantization. A larger Q4 model
+can beat a smaller Q8 one, but this is not a universal quality guarantee.
 
 Note that this is separate from `OLLAMA_KV_CACHE_TYPE=q8_0` (see [setup.md](setup.md)) —
 that quantizes the *KV cache*, not the weights, and there `q8_0` is exactly right.
@@ -116,7 +122,7 @@ known: **Ollama now ships MLX variants of some models.**
 
 MLX is Apple's own array framework, built for the M-series unified-memory architecture.
 The default Ollama execution path is llama.cpp with a Metal backend; MLX is a native
-alternative that is meaningfully faster on M-series hardware for the same weights.
+alternative whose performance depends on the model, quantization, and runtime.
 
 Currently available in this repo's model set:
 
@@ -130,7 +136,11 @@ Pull them with:
 ```
 
 `-UseMlx` substitutes the MLX tag wherever `models.json` declares one and falls back to the
-standard tag otherwise.
+standard tag otherwise. MLX download estimates are tracked separately; substitution is
+not a guarantee of identical weights or tuning. The inspected Qwen 3.6 and 3.8 MLX
+artifacts declared minimum Ollama versions 0.22.0 and 0.32.12 respectively; verify current
+requirements before pulling them. Existing models are not changed merely by updating
+these scripts.
 
 Do measure rather than assume. `Test-LocalStack.ps1` reports tokens/sec per model, so pull
 both variants and compare on your own hardware:
@@ -140,9 +150,9 @@ both variants and compare on your own hardware:
 ./scripts/Test-LocalStack.ps1 -Model 'qwen3.8:27b*' -UnloadAfterEach
 ```
 
-LM Studio (`brew install --cask lm-studio`) has an MLX backend too. Note that this makes it
-*comparable* to Ollama's MLX tags, not faster — same engine underneath. Its advantage is the
-GUI, not throughput. See [chat-apps.md](chat-apps.md).
+LM Studio (`brew install --cask lm-studio`) has an MLX backend too. Sharing a backend family
+does not guarantee identical throughput: compare matching weights, settings, and context.
+See [chat-apps.md](chat-apps.md).
 
 ---
 

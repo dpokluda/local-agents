@@ -1,11 +1,12 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Applies the performance knobs to the launchd service and starts Ollama.
+    Saves the performance knobs in a persistent service plist and starts Ollama.
 
 .DESCRIPTION
     Starts the brew-managed Ollama service on demand, after registering the environment
-    knobs that the server actually reads.
+    knobs that the server actually reads. Omitted settings reuse saved values, falling
+    back to _common.ps1 on the first run.
 
     Two things this gets right that are easy to get wrong by hand:
 
@@ -14,11 +15,11 @@
         for the always-on behaviour.
 
       * The server runs under launchd, which does NOT inherit your shell environment.
-        Setting $env:OLLAMA_* in a terminal has no effect on it. This script uses
-        `launchctl setenv` instead, which does work.
+        This script supplies a custom plist through Homebrew's --file option, so the
+        saved values override formula defaults and survive reboot with -AtLogin.
 
-    launchctl setenv values last until reboot, not forever. That is fine here, because
-    this script re-applies them every time it starts the service.
+    The file lives in ~/Library/Application Support/local-agents/ollama.plist.
+    No model files are changed. A running server is restarted when -AtLogin is supplied.
 
     Defaults live in scripts/_common.ps1 - change them there, not here.
 
@@ -48,11 +49,15 @@
     Faster attention kernel. Default $true.
 
 .PARAMETER ContextLength
-    Sets OLLAMA_CONTEXT_LENGTH. Unset by default, because a bigger window costs KV cache
-    RAM. Agent harnesses need it: 65536 is the practical floor on a 48GB machine.
+    Sets OLLAMA_CONTEXT_LENGTH. Omitted values reuse the saved setting; initially unset.
+    Pass 0 to return to Ollama's default. A larger window requires more memory.
 
 .PARAMETER NoEnvironment
-    Skip the knob registration entirely and just start the service.
+    Do not rewrite configuration. Reuse the saved plist if present, otherwise use
+    Homebrew's service definition. This does not reset settings to factory defaults.
+
+.PARAMETER Restart
+    Restart even when the API already answers. Restart-Ollama.ps1 forwards to this mode.
 
 .PARAMETER TimeoutSeconds
     How long to wait for the API to answer after starting.
@@ -79,11 +84,15 @@
 param(
     [switch]$AtLogin,
     [string]$KeepAlive,
+    [ValidateSet('f16', 'q8_0', 'q4_0')]
     [string]$KvCacheType,
     [bool]$FlashAttention,
+    [ValidateRange(0, 2147483647)]
     [int]$ContextLength,
+    [ValidateRange(0, 2147483647)]
     [int]$MaxLoadedModels,
     [switch]$NoEnvironment,
+    [switch]$Restart,
     [ValidateRange(5, 600)]
     [int]$TimeoutSeconds = 60,
     [string]$BaseUrl
@@ -94,40 +103,52 @@ $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot/_common.ps1"
 
-# Defaults are resolved here rather than in param() so they live in exactly one place.
-if (-not $PSBoundParameters.ContainsKey('KeepAlive')) { $KeepAlive = $LocalAgentDefaults.KeepAlive }
-if (-not $PSBoundParameters.ContainsKey('KvCacheType')) { $KvCacheType = $LocalAgentDefaults.KvCacheType }
-if (-not $PSBoundParameters.ContainsKey('FlashAttention')) { $FlashAttention = $LocalAgentDefaults.FlashAttention }
-if (-not $PSBoundParameters.ContainsKey('ContextLength')) { $ContextLength = $LocalAgentDefaults.ContextLength }
-if (-not $PSBoundParameters.ContainsKey('MaxLoadedModels')) { $MaxLoadedModels = $LocalAgentDefaults.MaxLoadedModels }
+$settings = Get-OllamaServiceSettings
+if (-not $PSBoundParameters.ContainsKey('KeepAlive')) { $KeepAlive = $settings.KeepAlive }
+if (-not $PSBoundParameters.ContainsKey('KvCacheType')) { $KvCacheType = $settings.KvCacheType }
+if (-not $PSBoundParameters.ContainsKey('FlashAttention')) { $FlashAttention = $settings.FlashAttention }
+if (-not $PSBoundParameters.ContainsKey('ContextLength')) { $ContextLength = $settings.ContextLength }
+if (-not $PSBoundParameters.ContainsKey('MaxLoadedModels')) { $MaxLoadedModels = $settings.MaxLoadedModels }
 
+if (-not $BaseUrl -and -not $env:OLLAMA_HOST) {
+    $savedEnvironment = Get-SavedOllamaEnvironment
+    if ($savedEnvironment.Contains('OLLAMA_HOST')) { $BaseUrl = $savedEnvironment['OLLAMA_HOST'] }
+}
 $BaseUrl = Resolve-LocalAgentBaseUrl -BaseUrl $BaseUrl
+Assert-OllamaServiceHost -BaseUrl $BaseUrl
 
 $existing = Get-OllamaVersion -BaseUrl $BaseUrl
-if ($existing) {
+if ($existing -and -not $Restart -and -not $AtLogin) {
     Write-Host "Ollama is already running at $BaseUrl (v$existing)." -ForegroundColor Green
     Write-Detail 'To apply different knobs to a running server, use ./scripts/Restart-Ollama.ps1'
     return
 }
 
+$action = if ($Restart -or $existing) { 'Restart Ollama and apply service configuration' } else { 'Configure and start Ollama' }
+if (-not $PSCmdlet.ShouldProcess("$BaseUrl (start at login: $AtLogin)", $action)) { return }
+
 if ($NoEnvironment) {
-    Write-Step 'Skipping environment knobs (-NoEnvironment)'
+    Write-Step 'Keeping existing service configuration (-NoEnvironment)'
 }
 else {
-    Write-Step 'Registering environment knobs with launchd'
+    Write-Step 'Saving persistent service configuration'
     Set-OllamaServiceKnob -KeepAlive $KeepAlive -KvCacheType $KvCacheType `
         -FlashAttention $FlashAttention -ContextLength $ContextLength `
-        -MaxLoadedModels $MaxLoadedModels
+        -MaxLoadedModels $MaxLoadedModels -BaseUrl $BaseUrl -Confirm:$false
 }
 
+# brew services start itself skips an already running on-demand service.
+Stop-OllamaService -BaseUrl $BaseUrl -Confirm:$false
 Write-Step "Starting Ollama ($(if ($AtLogin) { 'brew services start - registers at login' } else { 'brew services run - this session only' }))"
-Start-OllamaService -AtLogin:$AtLogin
-
-if ($WhatIfPreference) { return }
+Start-OllamaService -AtLogin:$AtLogin -Confirm:$false
 
 Write-Detail "Waiting up to ${TimeoutSeconds}s for the API..."
 $version = Wait-OllamaApi -BaseUrl $BaseUrl -TimeoutSeconds $TimeoutSeconds
 if (-not $version) {
-    throw "Ollama did not answer on $BaseUrl within ${TimeoutSeconds}s. Check 'brew services list' and ~/Library/Logs/Homebrew/ollama/."
+    throw "Ollama did not answer on $BaseUrl within ${TimeoutSeconds}s. Check 'brew services list' and ~/Library/Logs/local-agents/ollama.log."
+}
+$service = Get-BrewOllamaServiceInfo
+if (-not $service.running -or [bool]$service.registered -ne [bool]$AtLogin) {
+    throw 'Ollama answered, but Homebrew did not reach the requested running/login-registration state.'
 }
 Write-Ok "server up (v$version)"

@@ -54,7 +54,32 @@ Anything else that takes a custom base URL — Aider, OpenCode, Continue, any Op
 uses the same `http://localhost:11434/v1`. See [docs/harnesses.md](docs/harnesses.md), or
 [docs/chat-apps.md](docs/chat-apps.md) for plain chat rather than coding.
 
-Every script supports `-WhatIf`. Start there if you want to see what will happen first.
+Installation, service control, sync, and destructive model operations support `-WhatIf`.
+Read-only commands, inference, and the health check do not.
+
+### Already installed? Apply the script fixes without downloading models
+
+After getting these updated files onto your Mac, close active local-agent sessions and
+run the following in PowerShell 7 from this repository:
+
+```powershell
+./scripts/Restart-Ollama.ps1 -ContextLength 65536
+./scripts/Test-LocalStack.ps1 -Model 'qwen3-coder:30b' -MinimumContextLength 65536
+if ($LASTEXITCODE -ne 0) { throw 'Resolve the reported failure before starting an agent.' }
+./scripts/Start-LocalCopilot.ps1 -Model 'qwen3-coder:30b' -MaxPromptTokens 60000 -MaxOutputTokens 4096
+```
+
+Use a model you already have installed (`./scripts/Get-LocalModel.ps1` lists them).
+Add **`-AtLogin` to the restart command** if you want automatic startup after reboot;
+without it, the service remains on demand. This restarts the server and writes persistent
+settings, but **does not reinstall Ollama, sync, prune, or delete any model weights**.
+Omitted tuning settings on future starts/restarts reuse their saved values.
+
+The configuration lives outside the checkout at
+`~/Library/Application Support/local-agents/ollama.plist`; logs are at
+`~/Library/Logs/local-agents/ollama.log`. The older transient `launchctl` tuning values
+are cleared during migration. If the Ollama desktop app is running instead of the
+Homebrew service, quit it first. See [setup.md](docs/setup.md#3-environment-knobs).
 
 ---
 
@@ -89,8 +114,8 @@ it is worth being precise about which.
   sustain.
 - **Novel architecture and design work.** Taste and breadth are exactly what frontier scale
   buys, and exactly what quantized local weights give up.
-- **Anything needing current information.** Local models cannot browse. Their knowledge is
-  frozen at training time.
+- **Current information without connected tools.** Weights have a training cutoff.
+  A connected agent can still supply web/search tools to a local model; offline it cannot.
 
 **The pragmatic pattern:**
 
@@ -145,8 +170,9 @@ to single digits. Full math and derivation in [docs/models.md](docs/models.md).
 
 Two things worth knowing that are not obvious:
 
-- **`q4_K_M` is the right quantization.** `q8_0` doubles RAM for marginal gain; `bf16`
-  triples it. A bigger model at q4 beats a smaller model at q8 at equal memory.
+- **Check quantization per artifact.** Q4_K_M is a useful GGUF starting point, not a
+  universal default: `gpt-oss:20b` uses MXFP4, and the listed MLX variants use NVFP4.
+  Size/quality tradeoffs depend on the model and task.
 - **Ollama ships Apple-native MLX builds** (`qwen3.8:27b-mlx`, `qwen3.6:27b-mlx`) that are
   meaningfully faster on M-series than the default llama.cpp path. Pull them with
   `./scripts/Sync-Models.ps1 -Tier full -UseMlx`.
@@ -162,15 +188,18 @@ Model tags churn quickly. Re-verify sizes before trusting this table.
 ```
 
 The most important script here. Per model it reports throughput (from Ollama's eval
-counters, not wall clock), cold-load time, and whether **tool-calling actually works** — on
-both the native API and the OpenAI-compatible `/v1` endpoint that harnesses use.
+counters, not wall clock), load duration, and tool-call smoke checks: native `/api/chat`
+plus a **streamed `/v1/chat/completions` tool call and synthetic tool-result round trip**.
+Load duration is not a cold-start measurement if weights were already resident.
 
 That last check earns its place because its failure mode is silent. A model that ignores
 tool definitions does not throw an error; it writes a pleasant paragraph *about* calling the
 tool, the harness receives no `tool_calls`, and your agent loop quietly stalls. Catch it in
 a health check, not twenty minutes into a task.
 
-The script exits non-zero if any model fails, so it drops straight into a pre-flight script.
+The script exits non-zero if any requested benchmark, tool, context, or unload check fails.
+It does not certify long-context reasoning quality or the Responses API. Use
+`-MinimumContextLength 65536` to verify actual allocated context as well.
 
 ---
 
@@ -205,11 +234,19 @@ local-agents/
     └── _common.ps1                # internal: shared defaults + helpers, not run directly
 ```
 
-All scripts are idempotent and support `-WhatIf` where they change anything; destructive
-ones prompt by default. Run them from anywhere — they resolve their own dependencies via
+Sync skips existing tags; destructive operations prompt by default, including `-Prune`.
+Service control, installation, sync, and deletion support `-WhatIf`. Run scripts from
+anywhere — they resolve their own dependencies via
 `$PSScriptRoot`. Shared defaults (keep-alive, max loaded models, KV cache type, flash
 attention) live in one
 place: `scripts/_common.ps1`.
+
+Regression tests use Pester 5 and fake the server/Homebrew; they do not require model
+downloads or a running Ollama instance:
+
+```powershell
+Invoke-Pester ./tests/LocalAgents.Tests.ps1
+```
 
 ---
 

@@ -33,8 +33,8 @@
     background process you did not ask for, and a model left resident is not.
 
 .PARAMETER NoEnvironment
-    Skip the launchctl setenv step and start the server on Ollama's own defaults.
-    Mainly useful if you manage the environment yourself via the service plist.
+    Do not rewrite the saved service configuration. Reuse it if present; otherwise use
+    Homebrew's defaults. Mainly useful if you manage the environment yourself.
 
 .PARAMETER TimeoutSeconds
     How long to wait for the API to become reachable after starting the service.
@@ -75,7 +75,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Shared defaults and Set-OllamaServiceKnob. Dot-sourced first so the install-specific
+# Shared defaults. Dot-sourced first so the install-specific
 # helpers defined below take precedence where the names overlap.
 . "$PSScriptRoot/_common.ps1"
 
@@ -94,23 +94,6 @@ function Write-Ok {
 function Write-Skip {
     param([Parameter(Mandatory)][string]$Message)
     Write-Host "    --  $Message (already done)" -ForegroundColor DarkGray
-}
-
-function Test-OllamaApi {
-    <#
-        .SYNOPSIS
-            Returns the Ollama version string if the API answers, otherwise $null.
-    #>
-    [CmdletBinding()]
-    param([int]$TimeoutSec = 3)
-
-    try {
-        $response = Invoke-RestMethod -Uri "$script:OllamaBaseUrl/api/version" -TimeoutSec $TimeoutSec -ErrorAction Stop
-        return $response.version
-    }
-    catch {
-        return $null
-    }
 }
 
 function Test-BrewFormula {
@@ -187,59 +170,8 @@ if ($SkipService) {
     Write-Host '        ollama serve' -ForegroundColor DarkGray
 }
 else {
-    # `brew services run` starts the server now; `start` also registers it to launch at
-    # every login. Default to run - on-demand is the cheaper, less surprising behaviour.
-    $brewVerb = if ($AtLogin) { 'start' } else { 'run' }
-
-    # Apply the performance knobs BEFORE starting. launchd does not inherit a shell
-    # environment, so a server started without this step runs on Ollama's defaults
-    # (notably keep_alive 5m) no matter what is set in any terminal afterwards.
-    if ($NoEnvironment) {
-        Write-Step 'Skipping environment knobs (-NoEnvironment)'
-    }
-    else {
-        Write-Step 'Applying environment knobs (launchctl setenv)'
-        Set-OllamaServiceKnob `
-            -KeepAlive $LocalAgentDefaults.KeepAlive `
-            -KvCacheType $LocalAgentDefaults.KvCacheType `
-            -FlashAttention $LocalAgentDefaults.FlashAttention `
-            -MaxLoadedModels $LocalAgentDefaults.MaxLoadedModels `
-            -ContextLength $LocalAgentDefaults.ContextLength
-    }
-
-    Write-Step "Starting Ollama service (brew services $brewVerb)"
-    if (-not $AtLogin) {
-        Write-Host '    Not registered to launch at login. Re-run with -AtLogin for that,' -ForegroundColor DarkGray
-        Write-Host '    or start it per session with ./scripts/Start-Ollama.ps1' -ForegroundColor DarkGray
-    }
-
-    $existingVersion = Test-OllamaApi
-    if ($existingVersion) {
-        Write-Skip "server already answering on $script:OllamaBaseUrl (v$existingVersion)"
-        if (-not $NoEnvironment) {
-            Write-Host '    It was started before the knobs above were applied, so it is still' -ForegroundColor Yellow
-            Write-Host '    running on the old environment. Restart it to pick them up:' -ForegroundColor Yellow
-            Write-Host '        ./scripts/Restart-Ollama.ps1' -ForegroundColor Yellow
-        }
-    }
-    elseif ($PSCmdlet.ShouldProcess('ollama', "brew services $brewVerb")) {
-        & brew services $brewVerb ollama
-        if ($LASTEXITCODE -ne 0) { throw "brew services $brewVerb ollama failed with exit code $LASTEXITCODE." }
-
-        Write-Host "    Waiting up to ${TimeoutSeconds}s for the API to come up..." -ForegroundColor DarkGray
-        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-        $version = $null
-        while ((Get-Date) -lt $deadline) {
-            $version = Test-OllamaApi
-            if ($version) { break }
-            Start-Sleep -Seconds 1
-        }
-
-        if (-not $version) {
-            throw "Ollama did not answer on $script:OllamaBaseUrl within ${TimeoutSeconds}s. Check 'brew services list' and the log at ~/Library/Logs/Homebrew/ollama/."
-        }
-        Write-Ok "server up (v$version)"
-    }
+    & "$PSScriptRoot/Start-Ollama.ps1" -AtLogin:$AtLogin -NoEnvironment:$NoEnvironment `
+        -TimeoutSeconds $TimeoutSeconds -BaseUrl $script:OllamaBaseUrl
 }
 
 # --- 5. Optional GUI ----------------------------------------------------------

@@ -35,7 +35,7 @@ if (-not $version) {
 Write-Host "Ollama $version at $BaseUrl" -ForegroundColor Green
 
 # What the server process actually sees, not what this shell has.
-$serverEnv = Get-OllamaServerEnvironment
+$serverEnv = Get-OllamaServerEnvironment -BaseUrl $BaseUrl
 if ($serverEnv.Values.Count -gt 0) {
     Write-Host "  Server environment, via $($serverEnv.Source):" -ForegroundColor DarkGray
     foreach ($entry in $serverEnv.Values.GetEnumerator()) {
@@ -43,7 +43,7 @@ if ($serverEnv.Values.Count -gt 0) {
     }
 }
 else {
-    Write-Host '  No OLLAMA_* knobs set on the server process.' -ForegroundColor DarkGray
+    Write-Host "  No environment values available (source: $($serverEnv.Source)); settings are not verified." -ForegroundColor DarkGray
     Write-Host '  Apply them with: ./scripts/Restart-Ollama.ps1' -ForegroundColor DarkGray
 }
 
@@ -63,5 +63,7 @@ if ($loaded.Count -eq 0) {
 
 $loaded | Select-Object `
 @{ L = 'Model'; E = { $_.name } },
-@{ L = 'RAM(GB)'; E = { '{0:0.#}' -f ($_.size / 1GB) } },
+@{ L = 'RAM(GiB)'; E = { '{0:0.#}' -f ($_.size / 1GB) } },
+@{ L = 'GPU(GiB)'; E = { if ($_.PSObject.Properties['size_vram']) { '{0:0.#}' -f ($_.size_vram / 1GB) } else { 'unknown' } } },
+@{ L = 'Context'; E = { if ($_.PSObject.Properties['context_length']) { $_.context_length } else { 'unknown' } } },
 @{ L = 'ExpiresAt'; E = { $_.expires_at } }

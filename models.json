@@ -4,8 +4,9 @@
   "verified_against": "Ollama public model library",
   "notes": [
     "Model tags churn quickly. Re-verify against 'ollama search' / the Ollama library before trusting sizes.",
-    "size_gb is the on-disk download size of the default q4_K_M quantization unless stated otherwise.",
-    "Resident RAM while loaded is roughly size_gb plus KV cache, which grows with context length.",
+    "size_gb is a historical planning estimate in decimal GB, not a pinned artifact size. Check /api/tags for installed bytes; library pages and registry/backend variants may differ.",
+    "Resident memory also includes KV cache, compute buffers, and backend-specific overhead. Download size alone is not a fit test.",
+    "Most standard entries are GGUF/Q4_K_M; gpt-oss:20b is GGUF/MXFP4. The listed MLX alternatives are safetensors/NVFP4 and may have different sizes and runtime requirements.",
     "Tier membership is cumulative in intent: 'recommended' includes the 'minimal' model, 'full' includes everything."
   ],
   "ram_budget": {
@@ -42,6 +43,7 @@
     {
       "name": "gpt-oss-20b",
       "tag": "gpt-oss:20b",
+      "quantization": "MXFP4",
       "size_gb": 14,
       "purpose": "general",
       "tiers": ["recommended", "full"],
@@ -57,7 +59,8 @@
       "tiers": ["full"],
       "summary": "Coding-tuned variant of the Qwen 3.6 generation.",
       "tool_calling": "yes",
-      "mlx_tag": "qwen3.6:27b-mlx"
+      "mlx_tag": "qwen3.6:27b-mlx",
+      "mlx_size_gb": 18.8
     },
     {
       "name": "devstral-small-2-24b",
@@ -77,7 +80,8 @@
       "tiers": ["full"],
       "summary": "Newest Qwen generation. Best general reasoning in the set that still fits comfortably.",
       "tool_calling": "yes",
-      "mlx_tag": "qwen3.8:27b-mlx"
+      "mlx_tag": "qwen3.8:27b-mlx",
+      "mlx_size_gb": 18.2
     },
     {
       "name": "gemma4-26b",

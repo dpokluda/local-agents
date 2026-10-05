@@ -38,8 +38,8 @@
     Prompts for each, then removes both and reports the total reclaimed.
 
 .EXAMPLE
-    ./scripts/Get-LocalModel.ps1 | Where-Object { $_.Name -like 'gemma*' } |
-        Select-Object -ExpandProperty Name | ./scripts/Remove-LocalModel.ps1 -Force
+    ./scripts/Get-LocalModel.ps1 | Where-Object { $_.Model -like 'gemma*' } |
+        ./scripts/Remove-LocalModel.ps1 -Force
 
     Pipeline input, no prompting.
 

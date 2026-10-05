@@ -21,7 +21,7 @@ will not discover that offline.
 ./scripts/Test-LocalStack.ps1 -JsonPath ./out/preflight.json
 ```
 
-`Test-LocalStack.ps1` exits non-zero if any model fails a tool-calling check, so this is a
+`Test-LocalStack.ps1` exits non-zero if any requested check fails, so this is a
 single gate:
 
 ```powershell
@@ -120,21 +120,22 @@ Two prerequisites that are easy to miss, and both fail *after* you are offline:
   exactly this — confirm `Tools/v1` reads `pass`.
 - **Raise the context window.** Ollama's integration page recommends ≥64k tokens and
   GitHub's recommends ≥128k; on 48 GB, **64k is the practical floor** because KV cache
-  costs real RAM. Ollama's default `num_ctx` is far smaller than either. Set it and restart
+  costs real RAM. Ollama defaults vary by runtime and available memory. Set it and restart
   the service *before* you leave:
 
   ```powershell
   ./scripts/Restart-Ollama.ps1 -ContextLength 65536     # or 131072 if your budget allows
   ```
 
-  Then re-run `Test-LocalStack.ps1` and sanity-check RAM with
+  Then run `Test-LocalStack.ps1 -Model 'qwen3-coder:30b' -MinimumContextLength 65536`
+  and sanity-check RAM with
   `./scripts/Get-LocalAgentBudget.ps1` — a
-  large KV cache is gigabytes on top of the weights. Because a local tag is not in Copilot
+  large KV cache is additional memory on top of the weights. Because a local tag is not in Copilot
   CLI's model catalog, also pin the prompt budget so it does not fall back to a
   conservative default:
 
   ```powershell
-  ./scripts/Start-LocalCopilot.ps1 -Offline -MaxPromptTokens 60000
+  ./scripts/Start-LocalCopilot.ps1 -Offline -MaxPromptTokens 60000 -MaxOutputTokens 4096
   ```
 
 ### 6. Everything else your workflow needs is local
@@ -175,7 +176,7 @@ Write-Host 'Fetching git state...'   ; git fetch --all --tags
 Write-Host 'Warming model...'        ; ./scripts/Invoke-LocalChat.ps1 'ready?' | Out-Null
 Write-Host 'Verifying stack...'      ; ./scripts/Test-LocalStack.ps1 -JsonPath ./out/preflight.json
 
-if ($LASTEXITCODE -ne 0) { Write-Host 'NOT READY - tool-calling failed' -ForegroundColor Red }
+if ($LASTEXITCODE -ne 0) { Write-Host 'NOT READY - a requested check failed' -ForegroundColor Red }
 else { Write-Host 'Ready for offline work' -ForegroundColor Green }
 ```
 

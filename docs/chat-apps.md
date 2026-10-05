@@ -30,12 +30,10 @@ controls, and an **MLX backend** for Apple Silicon. It also runs its own OpenAI-
 server, so it can serve as a **Copilot app provider** — LM Studio is in the app's native
 provider list alongside Ollama.
 
-**On speed:** LM Studio is *not* meaningfully faster than Ollama on Apple Silicon. Both can
-run MLX — Ollama ships MLX tags (`qwen3.8:27b-mlx`, `qwen3.6:27b-mlx`), LM Studio has an MLX
-backend — and when both use it, throughput is comparable because it is the same engine
-underneath. **LM Studio's advantage is the UI**: browsing and trying models, inspecting
-parameters, seeing token counts. Pick it for ergonomics, not for tokens/sec. If you want
-numbers for your own hardware, measure instead of trusting anyone's claim:
+**On speed:** both can run MLX, but matching backend names do not guarantee matching
+weights, quantization, batching, or throughput. **LM Studio offers a model-browsing UI**;
+benchmark equivalent configurations rather than choosing on an assumed speed advantage.
+The following compares variants installed in Ollama, not LM Studio's API:
 
 ```powershell
 ./scripts/Test-LocalStack.ps1 -Model 'qwen3.8:27b*' -UnloadAfterEach

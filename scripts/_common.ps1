@@ -45,9 +45,7 @@ $LocalAgentDefaults = [ordered]@{
     # Faster attention kernel. The win grows with context length.
     FlashAttention = $true
 
-    # Ollama's default num_ctx is far below what models support, but a bigger window
-    # costs KV cache RAM, so this is opt-in rather than defaulted. 65536 is the practical
-    # floor for agent harnesses on a 48GB machine.
+    # Choose context explicitly: runtime defaults vary by version and available memory.
     ContextLength  = 0
 }
 
@@ -85,7 +83,48 @@ function Resolve-LocalAgentBaseUrl {
     if ([string]::IsNullOrWhiteSpace($BaseUrl)) { $BaseUrl = $env:OLLAMA_HOST }
     if ([string]::IsNullOrWhiteSpace($BaseUrl)) { $BaseUrl = $LocalAgentDefaults.BaseUrl }
 
-    return ($BaseUrl.TrimEnd('/') -replace '/v1$', '')
+    $BaseUrl = $BaseUrl.Trim().TrimEnd('/') -replace '/v1$', ''
+    if ($BaseUrl -notmatch '^[a-z][a-z0-9+.-]*://') { $BaseUrl = "http://$BaseUrl" }
+    $uri = $null
+    if (-not [uri]::TryCreate($BaseUrl, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -notin @('http', 'https') -or $uri.UserInfo -or
+        $uri.Query -or $uri.Fragment -or $uri.AbsolutePath -ne '/') {
+        throw "Invalid Ollama base URL '$BaseUrl'. Use an HTTP(S) host and port, optionally ending in /v1."
+    }
+    return $uri.AbsoluteUri.TrimEnd('/')
+}
+
+function Resolve-OllamaModelTag {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Tag)
+
+    $Tag = $Tag.Trim()
+    if (-not $Tag -or $Tag -match '\s') { throw "Invalid model tag '$Tag'." }
+    if (($Tag -split '/')[-1] -notmatch ':') {
+        return "${Tag}:latest"
+    }
+    return $Tag
+}
+
+function Invoke-OllamaCli {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$BaseUrl,
+        [Parameter(Mandatory)][string[]]$ArgumentList
+    )
+
+    if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
+        throw "The 'ollama' CLI was not found on PATH."
+    }
+    $savedHost = $env:OLLAMA_HOST
+    try {
+        $env:OLLAMA_HOST = Resolve-LocalAgentBaseUrl -BaseUrl $BaseUrl
+        & ollama @ArgumentList
+        if ($LASTEXITCODE -ne 0) { throw "ollama $($ArgumentList -join ' ') failed with exit code $LASTEXITCODE." }
+    }
+    finally {
+        if ($null -eq $savedHost) { Remove-Item Env:OLLAMA_HOST -ErrorAction SilentlyContinue }
+        else { $env:OLLAMA_HOST = $savedHost }
+    }
 }
 
 function Get-OllamaVersion {
@@ -143,6 +182,8 @@ function Get-OllamaServerPid {
     [CmdletBinding()]
     param()
 
+    if (-not $IsMacOS) { return $null }
+
     if (Get-Command brew -CommandType Application -ErrorAction SilentlyContinue) {
         try {
             $json = & brew services info ollama --json 2>$null
@@ -176,24 +217,26 @@ function Get-OllamaServerEnvironment {
             even `launchctl getenv` only describes what was injected into the launchd
             session - a plist's own EnvironmentVariables block does not appear there.
 
-            `ps eww` prints the process's real environment, so that is the primary
-            source. launchctl getenv is the fallback when the process cannot be read.
+            `ps eww` prints the process's real environment. launchctl getenv is only a
+            fallback hint, not proof of the running process's configuration.
 
             Returns a hashtable of OLLAMA_* values plus a Source label.
     #>
     [CmdletBinding()]
-    param()
+    param([string]$BaseUrl = 'http://localhost:11434')
 
     $result = @{ Source = 'none'; Values = [ordered]@{}; ProcessId = $null }
+    if (-not $IsMacOS -or -not ([uri](Resolve-LocalAgentBaseUrl $BaseUrl)).IsLoopback) {
+        return $result
+    }
 
     $serverPid = Get-OllamaServerPid
     if ($serverPid) {
         $result.ProcessId = $serverPid
         $raw = & ps eww -p $serverPid 2>$null | Out-String
-        if ($raw) {
-            # ps prints "KEY=VALUE KEY=VALUE ..." after the command. Values here never
-            # contain spaces, so stop each match at the next KEY= or end of line.
-            $matched = [regex]::Matches($raw, '(?m)\b(OLLAMA_[A-Z0-9_]+)=(\S*)')
+        if ($LASTEXITCODE -eq 0 -and $raw) {
+            # Preserve spaces in values such as OLLAMA_MODELS.
+            $matched = [regex]::Matches($raw, '(?m)\b(OLLAMA_[A-Z0-9_]+)=(.*?)(?=\s+[A-Za-z_][A-Za-z0-9_]*=|[\r\n]|$)')
             foreach ($m in $matched) {
                 $result.Values[$m.Groups[1].Value] = $m.Groups[2].Value
             }
@@ -338,9 +381,9 @@ function Format-ByteSize {
 
     if ($null -eq $Bytes) { return 'unknown' }
     if ($Bytes -lt 0) { return "-$(Format-ByteSize -Bytes ([long](-$Bytes)))" }
-    if ($Bytes -ge 1GB) { return ('{0:0.#} GB' -f ($Bytes / 1GB)) }
-    if ($Bytes -ge 1MB) { return ('{0:0.#} MB' -f ($Bytes / 1MB)) }
-    if ($Bytes -ge 1KB) { return ('{0:0.#} KB' -f ($Bytes / 1KB)) }
+    if ($Bytes -ge 1GB) { return ('{0:0.#} GiB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:0.#} MiB' -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ('{0:0.#} KiB' -f ($Bytes / 1KB)) }
     return "$Bytes B"
 }
 
@@ -414,76 +457,142 @@ function Get-ResidentOllamaModel {
     return @(@($running.models) | ForEach-Object { $_.name })
 }
 
+function Assert-OllamaServiceHost {
+    param([string]$BaseUrl = 'http://localhost:11434')
+
+    if (-not $IsMacOS) { throw 'Service management requires macOS. On Windows, manage the native Ollama application instead.' }
+    $uri = [uri](Resolve-LocalAgentBaseUrl $BaseUrl)
+    if (-not $uri.IsLoopback -or $uri.Scheme -ne 'http') {
+        throw 'Service management requires a local HTTP loopback endpoint; it cannot manage a remote server or terminate TLS.'
+    }
+    if (-not (Get-Command brew -ErrorAction SilentlyContinue)) { throw 'Homebrew is not on PATH.' }
+}
+
+function Get-OllamaServiceFile {
+    return (Join-Path $HOME 'Library' 'Application Support' 'local-agents' 'ollama.plist')
+}
+
+function Get-SavedOllamaEnvironment {
+    $values = [ordered]@{}
+    $path = Get-OllamaServiceFile
+    if (Test-Path -LiteralPath $path) {
+        $xml = [xml](Get-Content -LiteralPath $path -Raw -ErrorAction Stop)
+        $dictionary = $xml.SelectSingleNode('/plist/dict/key[.="EnvironmentVariables"]/following-sibling::dict[1]')
+        if ($null -eq $dictionary) { throw "Missing EnvironmentVariables in $path." }
+        foreach ($key in $dictionary.SelectNodes('key')) {
+            if ($key.NextSibling.LocalName -ne 'string') { throw "Invalid environment entry in $path." }
+            $values[$key.InnerText] = $key.NextSibling.InnerText
+        }
+    }
+    return $values
+}
+
+function Get-OllamaServiceSettings {
+    $settings = @{}
+    foreach ($entry in $LocalAgentDefaults.GetEnumerator()) { $settings[$entry.Key] = $entry.Value }
+    $saved = Get-SavedOllamaEnvironment
+    if ($saved.Count -gt 0 -and -not $saved.Contains('OLLAMA_MAX_LOADED_MODELS')) {
+        $settings.MaxLoadedModels = 0
+    }
+    $names = @{
+        KeepAlive = 'OLLAMA_KEEP_ALIVE'; KvCacheType = 'OLLAMA_KV_CACHE_TYPE'
+        FlashAttention = 'OLLAMA_FLASH_ATTENTION'; ContextLength = 'OLLAMA_CONTEXT_LENGTH'
+        MaxLoadedModels = 'OLLAMA_MAX_LOADED_MODELS'
+    }
+    foreach ($key in $names.Keys) {
+        if ($saved.Contains($names[$key])) { $settings[$key] = $saved[$names[$key]] }
+    }
+    $settings.FlashAttention = "$($settings.FlashAttention)" -in @('1', 'true')
+    $settings.ContextLength = [int]$settings.ContextLength
+    $settings.MaxLoadedModels = [int]$settings.MaxLoadedModels
+    return $settings
+}
+
+function Get-BrewOllamaServiceInfo {
+    $json = & brew services info ollama --json
+    if ($LASTEXITCODE -ne 0) { throw "brew services info failed with exit code $LASTEXITCODE." }
+    $items = @(($json -join "`n") | ConvertFrom-Json -ErrorAction Stop)
+    if ($items.Count -ne 1 -or -not $items[0].PSObject.Properties['service_name']) {
+        throw 'Homebrew did not return a single Ollama service with a service_name.'
+    }
+    return $items[0]
+}
+
 function Set-OllamaServiceKnob {
-    <#
-        .SYNOPSIS
-            Registers the performance knobs with launchd so the background server sees them.
-
-        .DESCRIPTION
-            `brew services` runs Ollama under launchd, which does NOT inherit your shell
-            environment - setting $env:OLLAMA_* in a shell has no effect on the server.
-            `launchctl setenv` is the mechanism that does work.
-
-            Note: launchctl setenv values persist until reboot, not permanently. The
-            scripts that start the service re-apply them every time, so in practice you
-            do not have to think about it.
-    #>
+    # A custom plist overrides formula defaults and survives login without this repo.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [string]$KeepAlive,
+        [ValidateSet('f16', 'q8_0', 'q4_0')]
         [string]$KvCacheType,
         [bool]$FlashAttention = $true,
+        [ValidateRange(0, 2147483647)]
         [int]$ContextLength = 0,
-        [int]$MaxLoadedModels = 0
+        [ValidateRange(0, 2147483647)]
+        [int]$MaxLoadedModels = 0,
+        [string]$BaseUrl = 'http://localhost:11434'
     )
 
+    Assert-OllamaServiceHost -BaseUrl $BaseUrl
+    $path = Get-OllamaServiceFile
+    if (-not $PSCmdlet.ShouldProcess($path, 'Persist Ollama service environment')) { return }
+
+    $service = Get-BrewOllamaServiceInfo
+    $prefix = (& brew --prefix ollama | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $prefix) { throw 'Could not locate the installed Ollama formula.' }
+    $executable = Join-Path $prefix 'bin' 'ollama'
+    if (-not (Test-Path -LiteralPath $executable)) { throw "Ollama executable not found: $executable" }
+
+    $environment = Get-SavedOllamaEnvironment
+    $observed = Get-OllamaServerEnvironment -BaseUrl $BaseUrl
+    foreach ($entry in $observed.Values.GetEnumerator()) {
+        if (-not $environment.Contains($entry.Key)) { $environment[$entry.Key] = $entry.Value }
+    }
     $knobs = [ordered]@{
         OLLAMA_FLASH_ATTENTION = $(if ($FlashAttention) { '1' } else { '0' })
         OLLAMA_KV_CACHE_TYPE   = $KvCacheType
         OLLAMA_KEEP_ALIVE      = $KeepAlive
+        OLLAMA_HOST            = Resolve-LocalAgentBaseUrl $BaseUrl
     }
-    if ($MaxLoadedModels -gt 0) {
-        $knobs['OLLAMA_MAX_LOADED_MODELS'] = "$MaxLoadedModels"
-    }
-    if ($ContextLength -gt 0) {
-        $knobs['OLLAMA_CONTEXT_LENGTH'] = "$ContextLength"
-    }
-
-    foreach ($knob in $knobs.GetEnumerator()) {
-        if ([string]::IsNullOrWhiteSpace($knob.Value)) { continue }
-        if ($PSCmdlet.ShouldProcess($knob.Key, "launchctl setenv $($knob.Value)")) {
-            & launchctl setenv $knob.Key $knob.Value
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "launchctl setenv $($knob.Key) returned exit code $LASTEXITCODE."
-            }
-            else {
-                Write-Ok "$($knob.Key)=$($knob.Value)"
-            }
-        }
+    foreach ($entry in $knobs.GetEnumerator()) { $environment[$entry.Key] = $entry.Value }
+    foreach ($entry in @{ OLLAMA_MAX_LOADED_MODELS = $MaxLoadedModels; OLLAMA_CONTEXT_LENGTH = $ContextLength }.GetEnumerator()) {
+        $environment.Remove($entry.Key)
+        if ($entry.Value -gt 0) { $environment[$entry.Key] = [string]$entry.Value }
     }
 
-    # launchctl setenv persists until reboot, so a value set by an earlier run would
-    # otherwise linger. Clear the opt-in knobs explicitly when they are not requested,
-    # so that what the scripts report is what the server actually sees.
-    $clear = @()
-    if ($MaxLoadedModels -le 0) { $clear += 'OLLAMA_MAX_LOADED_MODELS' }
-    if ($ContextLength -le 0) { $clear += 'OLLAMA_CONTEXT_LENGTH' }
+    $logDirectory = Join-Path $HOME 'Library' 'Logs' 'local-agents'
+    $log = [System.Security.SecurityElement]::Escape((Join-Path $logDirectory 'ollama.log'))
+    $program = [System.Security.SecurityElement]::Escape($executable)
+    $label = [System.Security.SecurityElement]::Escape($service.service_name)
+    $envXml = foreach ($entry in $environment.GetEnumerator()) {
+        '<key>{0}</key><string>{1}</string>' -f
+            [System.Security.SecurityElement]::Escape($entry.Key),
+            [System.Security.SecurityElement]::Escape([string]$entry.Value)
+    }
+    $content = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$label</string>
+<key>ProgramArguments</key><array><string>$program</string><string>serve</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>StandardOutPath</key><string>$log</string>
+<key>StandardErrorPath</key><string>$log</string>
+<key>EnvironmentVariables</key><dict>$($envXml -join "`n")</dict>
+</dict></plist>
+"@
+    $null = New-Item -ItemType Directory -Path (Split-Path $path), $logDirectory -Force -ErrorAction Stop
+    Set-Content -LiteralPath $path -Value $content -Encoding utf8 -ErrorAction Stop
+    & plutil -lint $path
+    if ($LASTEXITCODE -ne 0) { throw "Invalid service plist: $path" }
 
-    foreach ($name in $clear) {
-        if ($PSCmdlet.ShouldProcess($name, 'launchctl unsetenv')) {
-            & launchctl unsetenv $name
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "launchctl unsetenv $name returned exit code $LASTEXITCODE."
-            }
-        }
+    # Remove only the tuning keys written by the old scripts; keep OLLAMA_MODELS intact.
+    foreach ($name in 'OLLAMA_FLASH_ATTENTION', 'OLLAMA_KV_CACHE_TYPE', 'OLLAMA_KEEP_ALIVE',
+        'OLLAMA_MAX_LOADED_MODELS', 'OLLAMA_CONTEXT_LENGTH') {
+        & launchctl unsetenv $name
+        if ($LASTEXITCODE -ne 0) { throw "Could not clear legacy launchctl setting $name." }
     }
-
-    if ($ContextLength -le 0) {
-        Write-Detail 'OLLAMA_CONTEXT_LENGTH not set (Ollama default). Pass -ContextLength 65536 for agent work.'
-    }
-    if ($MaxLoadedModels -le 0) {
-        Write-Detail 'OLLAMA_MAX_LOADED_MODELS not set (Ollama default). Models may accumulate in memory.'
-    }
+    Write-Ok "service configuration saved to $path"
 }
 
 # --- Service control ----------------------------------------------------------
@@ -505,7 +614,10 @@ function Start-OllamaService {
 
     if (-not $PSCmdlet.ShouldProcess('ollama', "brew services $verb")) { return }
 
-    & brew services $verb ollama
+    $arguments = @('services', $verb, 'ollama')
+    $path = Get-OllamaServiceFile
+    if (Test-Path -LiteralPath $path) { $arguments += "--file=$path" }
+    & brew @arguments
     if ($LASTEXITCODE -ne 0) { throw "brew services $verb ollama failed with exit code $LASTEXITCODE." }
 
     if ($AtLogin) { Write-Ok 'service started and registered to launch at login' }
@@ -518,13 +630,18 @@ function Stop-OllamaService {
             Stops the brew-managed Ollama service and unregisters any login item.
     #>
     [CmdletBinding(SupportsShouldProcess)]
-    param()
+    param([string]$BaseUrl = 'http://localhost:11434')
+
+    Assert-OllamaServiceHost -BaseUrl $BaseUrl
 
     if (-not $PSCmdlet.ShouldProcess('ollama', 'brew services stop')) { return }
 
     & brew services stop ollama
-    if ($LASTEXITCODE -ne 0) { Write-Warning "brew services stop ollama returned exit code $LASTEXITCODE." }
-    else { Write-Ok 'service stopped' }
+    if ($LASTEXITCODE -ne 0) { throw "brew services stop ollama returned exit code $LASTEXITCODE." }
+    if (Get-OllamaVersion -BaseUrl $BaseUrl) {
+        throw "Ollama still answers at $BaseUrl. Quit the Ollama desktop app or manually started server before managing the Homebrew service."
+    }
+    Write-Ok 'service stopped'
 }
 
 function Wait-OllamaApi {

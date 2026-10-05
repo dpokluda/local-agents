@@ -52,6 +52,11 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/_common.ps1"
+if (-not $IsMacOS) { throw 'This uninstaller only manages the macOS Homebrew installation.' }
+$savedEnvironment = Get-SavedOllamaEnvironment
+$baseUrl = $LocalAgentDefaults.BaseUrl
+if ($savedEnvironment.Contains('OLLAMA_HOST')) { $baseUrl = $savedEnvironment['OLLAMA_HOST'] }
 
 if ($Force -and -not $PSBoundParameters.ContainsKey('Confirm')) {
     $ConfirmPreference = 'None'
@@ -114,16 +119,15 @@ if ($hasBrew) {
 Write-Step 'Stopping the Ollama service'
 
 if (-not $hasBrew) {
+    if (Get-OllamaVersion -BaseUrl $baseUrl) { throw 'Ollama is still running. Stop it before uninstalling or deleting its configuration.' }
     Write-Skip 'no brew; skipping'
 }
 elseif ($PSCmdlet.ShouldProcess('ollama', 'brew services stop')) {
-    & brew services stop ollama 2>&1 | Write-Verbose
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning 'brew services stop ollama returned non-zero. It may not have been running.'
-    }
-    else {
-        Write-Host '    OK  service stopped' -ForegroundColor Green
-    }
+    Stop-OllamaService -BaseUrl $baseUrl -Confirm:$false
+}
+elseif (-not $WhatIfPreference) {
+    Write-Warning 'Service stop was declined; uninstall was cancelled.'
+    return
 }
 
 # --- 2. Uninstall the formula -------------------------------------------------
@@ -138,7 +142,7 @@ elseif (-not (Test-BrewPackage -Name 'ollama' -Kind 'formula')) {
 }
 elseif ($PSCmdlet.ShouldProcess('ollama', 'brew uninstall')) {
     & brew uninstall ollama
-    if ($LASTEXITCODE -ne 0) { Write-Warning "brew uninstall ollama returned exit code $LASTEXITCODE." }
+    if ($LASTEXITCODE -ne 0) { throw "brew uninstall ollama returned exit code $LASTEXITCODE." }
     else { Write-Host '    OK  formula removed' -ForegroundColor Green }
 }
 
@@ -155,7 +159,7 @@ if ($RemoveLmStudio) {
     }
     elseif ($PSCmdlet.ShouldProcess('lm-studio', 'brew uninstall --cask')) {
         & brew uninstall --cask lm-studio
-        if ($LASTEXITCODE -ne 0) { Write-Warning "brew uninstall --cask lm-studio returned exit code $LASTEXITCODE." }
+        if ($LASTEXITCODE -ne 0) { throw "brew uninstall --cask lm-studio returned exit code $LASTEXITCODE." }
         else { Write-Host '    OK  cask removed' -ForegroundColor Green }
     }
 }
@@ -176,6 +180,14 @@ elseif ($PSCmdlet.ShouldProcess($modelDir, 'Remove directory and all downloaded 
 }
 
 # --- Done ---------------------------------------------------------------------
+
+$serviceFile = Get-OllamaServiceFile
+if ((Test-Path -LiteralPath $serviceFile) -and $PSCmdlet.ShouldProcess($serviceFile, 'Remove saved service configuration')) {
+    Remove-Item -LiteralPath $serviceFile -Force
+}
+if ($savedEnvironment.Contains('OLLAMA_MODELS')) {
+    Write-Host "Custom model storage was not deleted: $($savedEnvironment['OLLAMA_MODELS'])" -ForegroundColor Yellow
+}
 
 Write-Host ''
 Write-Step 'Revert complete.'

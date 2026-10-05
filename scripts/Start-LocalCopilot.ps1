@@ -37,6 +37,10 @@
     unrecognized model ID makes the agent fall back to conservative defaults, so match
     this to your configured context length (minus room for the response).
 
+.PARAMETER MaxOutputTokens
+    Passed as COPILOT_PROVIDER_MAX_OUTPUT_TOKENS. Set this along with the prompt budget
+    so their sum fits the server's allocated context window.
+
 .PARAMETER BaseUrl
     Ollama base URL. Defaults to $env:OLLAMA_HOST, then http://localhost:11434.
 
@@ -67,7 +71,11 @@ param(
     [ValidateSet('completions', 'responses')]
     [string]$WireApi,
 
+    [ValidateRange(1, 2147483647)]
     [int]$MaxPromptTokens,
+
+    [ValidateRange(1, 2147483647)]
+    [int]$MaxOutputTokens,
 
     [string]$BaseUrl,
 
@@ -88,6 +96,7 @@ if (-not $copilot) {
 
 if ([string]::IsNullOrWhiteSpace($Model)) { $Model = $env:LOCAL_AGENT_MODEL }
 if ([string]::IsNullOrWhiteSpace($Model)) { $Model = $LocalAgentDefaults.Model }
+$Model = Resolve-OllamaModelTag $Model
 
 # Resolve-LocalAgentBaseUrl strips any /v1 for the native API checks below.
 $nativeUrl = Resolve-LocalAgentBaseUrl -BaseUrl $BaseUrl
@@ -106,7 +115,7 @@ catch {
     return
 }
 
-if ($installed -notcontains $Model) {
+if ($installed -cnotcontains $Model) {
     Write-Warning "Model '$Model' is not installed. Available: $($installed -join ', ')"
     Write-Warning "Pull it with: ./scripts/Sync-Models.ps1 -Tag '$Model'"
     return
@@ -115,12 +124,19 @@ if ($installed -notcontains $Model) {
 # Scope the configuration to the child process so the current shell stays clean.
 $childEnv = @{
     COPILOT_PROVIDER_BASE_URL = $providerUrl
+    COPILOT_PROVIDER_TYPE     = 'openai'
+    COPILOT_PROVIDER_MODEL_ID = $Model
+    COPILOT_PROVIDER_WIRE_MODEL = $Model
+    COPILOT_PROVIDER_WIRE_API = $(if ($WireApi) { $WireApi } else { 'completions' })
     COPILOT_MODEL             = $Model
 }
 if ($Offline) { $childEnv['COPILOT_OFFLINE'] = 'true' }
 if ($WireApi) { $childEnv['COPILOT_PROVIDER_WIRE_API'] = $WireApi }
 if ($PSBoundParameters.ContainsKey('MaxPromptTokens')) {
     $childEnv['COPILOT_PROVIDER_MAX_PROMPT_TOKENS'] = "$MaxPromptTokens"
+}
+if ($PSBoundParameters.ContainsKey('MaxOutputTokens')) {
+    $childEnv['COPILOT_PROVIDER_MAX_OUTPUT_TOKENS'] = "$MaxOutputTokens"
 }
 
 Write-Host "Copilot CLI -> $providerUrl  model: $Model$(if ($WireApi) { "  wire: $WireApi" })$(if ($Offline) { '  [offline]' })" -ForegroundColor Green

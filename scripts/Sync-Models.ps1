@@ -26,7 +26,7 @@
 
 .PARAMETER UseMlx
     Prefer the Apple-Silicon-native MLX variant of a model when the manifest declares one.
-    MLX builds are meaningfully faster on M-series hardware.
+    MLX builds require a compatible Ollama runtime; benchmark rather than assuming speed.
 
 .PARAMETER ListOnly
     Show the plan (what is present, what would be pulled, disk totals) and exit.
@@ -66,7 +66,7 @@ param(
 
     [string]$ManifestPath = (Join-Path $PSScriptRoot '..' 'models.json'),
 
-    [string]$BaseUrl = 'http://localhost:11434',
+    [string]$BaseUrl,
 
     [switch]$UseMlx,
 
@@ -82,6 +82,7 @@ $ErrorActionPreference = 'Stop'
 # Shared helpers: Get-HttpErrorDetail. Dot-sourced before the local helpers below, so
 # the script-specific versions win on name overlap.
 . "$PSScriptRoot/_common.ps1"
+$BaseUrl = Resolve-LocalAgentBaseUrl -BaseUrl $BaseUrl
 
 function Write-Step {
     param([Parameter(Mandatory)][string]$Message)
@@ -113,14 +114,19 @@ function Invoke-OllamaPull {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ModelTag)
 
-    if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
-        throw "The 'ollama' CLI was not found on PATH. Run ./scripts/Install-LocalAgents.ps1 first."
-    }
-
     # The CLI is used rather than the HTTP API so the user sees native download progress.
-    & ollama pull $ModelTag
-    if ($LASTEXITCODE -ne 0) {
-        throw "ollama pull $ModelTag failed with exit code $LASTEXITCODE."
+    Invoke-OllamaCli -BaseUrl $BaseUrl -ArgumentList @('pull', $ModelTag)
+}
+
+function Remove-SyncModel {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param([Parameter(Mandatory)][string]$ModelTag)
+
+    if ($PSCmdlet.ShouldProcess("$ModelTag at $BaseUrl", 'Delete model outside selected tier')) {
+        Invoke-OllamaCli -BaseUrl $BaseUrl -ArgumentList @('rm', $ModelTag)
+        if (@(Get-InstalledModel -Uri $BaseUrl | Where-Object { $_.name -ceq $ModelTag }).Count -gt 0) {
+            throw "Ollama reported deletion success but '$ModelTag' is still installed at $BaseUrl."
+        }
     }
 }
 
@@ -130,18 +136,23 @@ $ManifestPath = (Resolve-Path -LiteralPath $ManifestPath).Path
 Write-Step "Reading manifest: $ManifestPath"
 
 $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
-Write-Host "    Manifest verified $($manifest.verified_date) against $($manifest.verified_against)." -ForegroundColor DarkGray
-Write-Host '    Model tags churn quickly - re-verify if this date is stale.' -ForegroundColor DarkGray
+Write-Host "    Manifest reference date: $($manifest.verified_date) ($($manifest.verified_against))." -ForegroundColor DarkGray
+Write-Host '    Sizes are planning estimates, not pinned artifacts. Installed bytes may differ.' -ForegroundColor DarkGray
 
 $memoryBudgetGb = $manifest.ram_budget.usable_for_weights_gb
 
 # --- Resolve the desired set --------------------------------------------------
 
 if ($PSCmdlet.ParameterSetName -eq 'Tag') {
-    $desired = foreach ($t in $Tag) {
-        $known = $manifest.models | Where-Object { $_.tag -eq $t -or $_.mlx_tag -eq $t }
+    $desired = foreach ($inputTag in $Tag) {
+        $t = Resolve-OllamaModelTag -Tag $inputTag
+        $known = $manifest.models | Where-Object { $_.tag -ceq $t -or $_.mlx_tag -ceq $t }
         if ($known) {
-            [pscustomobject]@{ Tag = $t; SizeGb = $known.size_gb; Purpose = $known.purpose }
+            $size = $known.size_gb
+            if ($known.mlx_tag -ceq $t) {
+                $size = if ($known.PSObject.Properties['mlx_size_gb']) { $known.mlx_size_gb } else { $null }
+            }
+            [pscustomobject]@{ Tag = $t; SizeGb = $size; Purpose = $known.purpose }
         }
         else {
             Write-Warning "Tag '$t' is not in the manifest. Pulling anyway; size is unknown."
@@ -158,26 +169,28 @@ else {
 
     $desired = foreach ($m in $selected) {
         $useTag = $m.tag
+        $size = $m.size_gb
         if ($UseMlx -and $m.mlx_tag) {
             $useTag = $m.mlx_tag
+            $size = if ($m.PSObject.Properties['mlx_size_gb']) { $m.mlx_size_gb } else { $null }
             Write-Host "    Using MLX build for $($m.tag) -> $useTag" -ForegroundColor DarkGray
         }
-        [pscustomobject]@{ Tag = $useTag; SizeGb = $m.size_gb; Purpose = $m.purpose }
+        [pscustomobject]@{ Tag = $useTag; SizeGb = $size; Purpose = $m.purpose }
     }
     $selectionLabel = "tier '$Tier'"
 }
 
-$desired = @($desired)
+$desired = @($desired | Sort-Object Tag -Unique -CaseSensitive)
 
 # --- Compare against what is installed ----------------------------------------
 
 Write-Step "Planning sync for $selectionLabel"
 
-$installed = Get-InstalledModel -Uri $BaseUrl
+$installed = @(Get-InstalledModel -Uri $BaseUrl)
 $installedTags = @($installed | ForEach-Object { $_.name })
 
 $plan = foreach ($d in $desired) {
-    $present = $installedTags -contains $d.Tag
+    $present = $installedTags -ccontains $d.Tag
     [pscustomobject]@{
         Tag     = $d.Tag
         SizeGb  = $d.SizeGb
@@ -193,21 +206,28 @@ $plan | Format-Table -AutoSize @{ L = 'Model'; E = { $_.Tag } },
                                @{ L = 'Action'; E = { $_.Status } } | Out-Host
 
 $toPull = @($plan | Where-Object { $_.Status -eq 'pull' })
-$pullGb = ($toPull | Where-Object { $null -ne $_.SizeGb } | Measure-Object -Property SizeGb -Sum).Sum
-if (-not $pullGb) { $pullGb = 0 }
-$totalGb = ($plan | Where-Object { $null -ne $_.SizeGb } | Measure-Object -Property SizeGb -Sum).Sum
-if (-not $totalGb) { $totalGb = 0 }
+$pullGb = 0.0
+$totalGb = 0.0
+foreach ($item in $plan) {
+    if ($null -ne $item.SizeGb) {
+        $totalGb += $item.SizeGb
+        if ($item.Status -eq 'pull') { $pullGb += $item.SizeGb }
+    }
+}
+if (@($plan | Where-Object { $null -eq $_.SizeGb }).Count -gt 0) {
+    Write-Warning 'Totals exclude models whose download size is unknown.'
+}
 
 Write-Host "    To download: $($toPull.Count) model(s), roughly ${pullGb}GB." -ForegroundColor White
 Write-Host "    Set total on disk when complete: roughly ${totalGb}GB." -ForegroundColor White
 
-$oversized = @($plan | Where-Object { $null -ne $_.SizeGb -and $_.SizeGb -gt $memoryBudgetGb })
+$oversized = @($plan | Where-Object { $null -ne $_.SizeGb -and ($_.SizeGb * 1e9) -gt ($memoryBudgetGb * 1GB) })
 foreach ($o in $oversized) {
-    Write-Warning "$($o.Tag) is $($o.SizeGb)GB, above the ${memoryBudgetGb}GB weight budget in the manifest. It will swap or fail to load."
+    Write-Warning "$($o.Tag) is estimated at $($o.SizeGb)GB, above the manifest's ${memoryBudgetGb}GiB planning budget. It may fail to load or run slowly."
 }
 
-if ($totalGb -gt $memoryBudgetGb) {
-    Write-Host "    Note: the set totals more than the ${memoryBudgetGb}GB RAM budget. That is fine on disk - just do not expect to hold them all resident at once." -ForegroundColor DarkGray
+if (($totalGb * 1e9) -gt ($memoryBudgetGb * 1GB)) {
+    Write-Host "    Note: the set totals more than the ${memoryBudgetGb}GiB RAM budget. That is fine on disk - just do not expect to hold them all resident at once." -ForegroundColor DarkGray
 }
 
 if ($ListOnly) {
@@ -227,10 +247,29 @@ else {
         $index++
         Write-Host ''
         Write-Host "[$index/$($toPull.Count)] $($item.Tag)" -ForegroundColor Yellow
-        if ($PSCmdlet.ShouldProcess($item.Tag, 'ollama pull')) {
+        if ($PSCmdlet.ShouldProcess("$($item.Tag) at $BaseUrl", 'ollama pull')) {
             Invoke-OllamaPull -ModelTag $item.Tag
         }
     }
+}
+
+if ($WhatIfPreference) {
+    Write-Step 'Preview complete; no models were downloaded or deleted.'
+    if ($Prune) {
+        $keep = @($desired.Tag)
+        foreach ($extraModel in @($installed | Where-Object { $keep -cnotcontains $_.name })) {
+            Remove-SyncModel -ModelTag $extraModel.name -WhatIf
+        }
+    }
+    return
+}
+
+# Do not prune a working fallback set if the requested replacement is incomplete.
+$final = @(Get-InstalledModel -Uri $BaseUrl)
+$finalTags = @($final | ForEach-Object { $_.name })
+$missing = @($desired | Where-Object { $finalTags -cnotcontains $_.Tag })
+if ($missing.Count -gt 0) {
+    throw "Still missing after sync: $(($missing | ForEach-Object { $_.Tag }) -join ', '). Pruning was not attempted."
 }
 
 # --- Prune --------------------------------------------------------------------
@@ -239,17 +278,15 @@ if ($Prune) {
     Write-Step 'Pruning models outside the selected tier'
 
     $keep = @($desired | ForEach-Object { $_.Tag })
-    $refreshed = Get-InstalledModel -Uri $BaseUrl
-    $extra = @($refreshed | Where-Object { $keep -notcontains $_.name })
+    $extra = @($final | Where-Object { $keep -cnotcontains $_.name })
 
     if ($extra.Count -eq 0) {
         Write-Host '    Nothing to prune.' -ForegroundColor DarkGray
     }
     foreach ($e in $extra) {
-        if ($PSCmdlet.ShouldProcess($e.name, 'ollama rm')) {
-            & ollama rm $e.name
-            if ($LASTEXITCODE -ne 0) { Write-Warning "ollama rm $($e.name) failed with exit code $LASTEXITCODE." }
-        }
+        $confirmation = @{}
+        if ($PSBoundParameters.ContainsKey('Confirm')) { $confirmation.Confirm = $PSBoundParameters['Confirm'] }
+        Remove-SyncModel -ModelTag $e.name @confirmation
     }
 }
 
@@ -257,12 +294,12 @@ if ($Prune) {
 
 Write-Step 'Verifying'
 
-$final = Get-InstalledModel -Uri $BaseUrl
+$final = @(Get-InstalledModel -Uri $BaseUrl)
 $finalTags = @($final | ForEach-Object { $_.name })
-$missing = @($desired | Where-Object { $finalTags -notcontains $_.Tag })
+$missing = @($desired | Where-Object { $finalTags -cnotcontains $_.Tag })
 
-if ($missing.Count -gt 0 -and -not $WhatIfPreference) {
-    Write-Warning "Still missing after sync: $(($missing | ForEach-Object { $_.Tag }) -join ', ')"
+if ($missing.Count -gt 0) {
+    throw "Still missing after sync: $(($missing | ForEach-Object { $_.Tag }) -join ', ')"
 }
 else {
     Write-Host "    All $($desired.Count) model(s) for $selectionLabel are present." -ForegroundColor Green

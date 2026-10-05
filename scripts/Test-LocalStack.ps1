@@ -9,11 +9,11 @@
     For each installed model it:
       1. Runs a short completion and measures generation throughput (tokens/sec) using
          Ollama's own eval counters rather than wall-clock time.
-      2. Records cold-load time (how long the weights took to map into memory).
+      2. Records load_duration (a warm model does not measure cold-start latency).
       3. Sends a request carrying a tool definition and verifies the model emits a
          well-formed tool call - correct function name, parseable arguments, expected key.
-      4. Repeats the tool check against the OpenAI-compatible /v1 endpoint, which is the
-         path real agent harnesses actually use.
+      4. Reassembles streamed tool calls from /v1/chat/completions, sends a synthetic
+         weather tool result back, and checks that the final reply uses it.
 
     Step 3/4 is the point of this script. A model that generates beautiful prose but
     silently ignores tool definitions is useless in an agent loop, and the failure mode
@@ -31,7 +31,8 @@
     Per-request timeout. Cold-loading a 19GB model can take a while on first touch.
 
 .PARAMETER KeepAlive
-    Value passed as Ollama's keep_alive for test requests.
+    Value passed as Ollama's keep_alive for native test requests. Defaults to the saved
+    service setting, or the shared default. OpenAI requests use the server's setting.
 
 .PARAMETER UnloadAfterEach
     Unload each model from memory after testing it. Use this when testing a large tier
@@ -45,6 +46,10 @@
 
 .PARAMETER JsonPath
     Also write the full results to this path as JSON, for tracking regressions over time.
+
+.PARAMETER MinimumContextLength
+    Require at least this many allocated tokens in /api/ps after testing each model.
+    This checks configuration, not long-context quality. The model must remain loaded.
 
 .EXAMPLE
     ./scripts/Test-LocalStack.ps1
@@ -65,18 +70,21 @@
 param(
     [string[]]$Model,
 
-    [string]$BaseUrl = 'http://localhost:11434',
+    [string]$BaseUrl,
 
     [ValidateRange(10, 1800)]
     [int]$TimeoutSeconds = 300,
 
-    [string]$KeepAlive = '5m',
+    [string]$KeepAlive,
 
     [switch]$UnloadAfterEach,
 
     [switch]$SkipBenchmark,
 
     [switch]$SkipToolCheck,
+
+    [ValidateRange(1, 2147483647)]
+    [int]$MinimumContextLength,
 
     [string]$JsonPath
 )
@@ -87,6 +95,8 @@ $ErrorActionPreference = 'Stop'
 # Shared helpers: Get-OllamaServerEnvironment and Get-HttpErrorDetail. Dot-sourced
 # before the local helpers below, so the script-specific versions win on name overlap.
 . "$PSScriptRoot/_common.ps1"
+$BaseUrl = Resolve-LocalAgentBaseUrl -BaseUrl $BaseUrl
+if (-not $KeepAlive) { $KeepAlive = (Get-OllamaServiceSettings).KeepAlive }
 
 $BenchmarkPrompt = 'Write a PowerShell one-liner that lists files larger than 10 MB under the current directory. Answer with the command and one sentence of explanation.'
 
@@ -182,7 +192,7 @@ function Test-ToolCallShape {
     if ([string]::IsNullOrWhiteSpace($FunctionName)) {
         return [pscustomobject]@{ Ok = $false; Detail = 'tool call had no function name' }
     }
-    if ($FunctionName -ne 'get_current_weather') {
+    if ($FunctionName -cne 'get_current_weather') {
         return [pscustomobject]@{ Ok = $false; Detail = "called '$FunctionName' instead of 'get_current_weather'" }
     }
 
@@ -193,9 +203,19 @@ function Test-ToolCallShape {
         catch { return [pscustomobject]@{ Ok = $false; Detail = 'arguments were not valid JSON' } }
     }
 
+    if ($parsed -isnot [pscustomobject]) {
+        return [pscustomobject]@{ Ok = $false; Detail = 'arguments must be a JSON object' }
+    }
     $location = Get-Prop -InputObject $parsed -Name 'location'
-    if ([string]::IsNullOrWhiteSpace([string]$location)) {
-        return [pscustomobject]@{ Ok = $false; Detail = "required argument 'location' was missing" }
+    if ($location -isnot [string] -or [string]::IsNullOrWhiteSpace($location)) {
+        return [pscustomobject]@{ Ok = $false; Detail = "required argument 'location' must be a nonempty string" }
+    }
+    if ($location -notmatch '(?i)\bPrague\b|\bPraha\b') {
+        return [pscustomobject]@{ Ok = $false; Detail = "tool call requested '$location', not Prague" }
+    }
+    $unit = $parsed.PSObject.Properties['unit']
+    if ($null -ne $unit -and ($unit.Value -isnot [string] -or $unit.Value -cnotin @('celsius', 'fahrenheit'))) {
+        return [pscustomobject]@{ Ok = $false; Detail = "argument 'unit' did not match the schema" }
     }
 
     return [pscustomobject]@{ Ok = $true; Detail = "get_current_weather(location='$location')" }
@@ -230,10 +250,8 @@ function Invoke-Benchmark {
     $loadNs = [double](Get-Prop -InputObject $response -Name 'load_duration' -Default 0)
     $promptCount = [double](Get-Prop -InputObject $response -Name 'prompt_eval_count' -Default 0)
 
-    $tokensPerSecond = $null
-    if ($evalNs -gt 0) {
-        $tokensPerSecond = [math]::Round($evalCount / ($evalNs / 1e9), 1)
-    }
+    if ($evalNs -le 0 -or $evalCount -le 0) { throw 'Benchmark returned no valid generation counters.' }
+    $tokensPerSecond = [math]::Round($evalCount / ($evalNs / 1e9), 1)
 
     return [pscustomobject]@{
         TokensPerSecond = $tokensPerSecond
@@ -272,8 +290,8 @@ function Invoke-NativeToolCheck {
     $message = Get-Prop -InputObject $response -Name 'message'
     $toolCalls = @(Get-Prop -InputObject $message -Name 'tool_calls' -Default @())
 
-    if ($toolCalls.Count -eq 0) {
-        return [pscustomobject]@{ Ok = $false; Detail = 'model replied with text instead of a tool call' }
+    if ($toolCalls.Count -ne 1) {
+        return [pscustomobject]@{ Ok = $false; Detail = "expected one weather tool call, received $($toolCalls.Count)" }
     }
 
     $fn = Get-Prop -InputObject $toolCalls[0] -Name 'function'
@@ -281,11 +299,76 @@ function Invoke-NativeToolCheck {
         -Arguments (Get-Prop -InputObject $fn -Name 'arguments')
 }
 
+function ConvertFrom-OpenAiEventStream {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Content)
+
+    $calls = @{}
+    $text = ''
+    $reasoning = ''
+    $finish = $null
+    $done = $false
+    foreach ($event in ($Content -split '\r?\n\r?\n')) {
+        $data = @(foreach ($line in ($event -split '\r?\n')) {
+            if ($line.StartsWith('data:')) { $line.Substring(5).TrimStart() }
+        }) -join "`n"
+        if (-not $data) { continue }
+        if ($done) { throw 'Received data after the stream terminator.' }
+        if ($data.Trim() -eq '[DONE]') { $done = $true; continue }
+        $chunk = $data | ConvertFrom-Json -ErrorAction Stop
+        if (Get-Prop $chunk 'error') { throw "Stream error: $data" }
+        foreach ($choice in @(Get-Prop $chunk 'choices' @())) {
+            if ((Get-Prop $choice 'index' -1) -ne 0) { throw 'Unexpected choice index in stream.' }
+            $delta = Get-Prop $choice 'delta'
+            $text += [string](Get-Prop $delta 'content' '')
+            $reasoning += [string](Get-Prop $delta 'reasoning' '')
+            foreach ($part in @(Get-Prop $delta 'tool_calls' @())) {
+                $index = Get-Prop $part 'index' -1
+                if ($index -isnot [long] -and $index -isnot [int]) { throw 'Invalid tool-call index in stream.' }
+                if ($index -lt 0) { throw 'Missing tool-call index in stream.' }
+                if (-not $calls.ContainsKey($index)) {
+                    $calls[$index] = @{ id = ''; type = 'function'; function = @{ name = ''; arguments = '' } }
+                }
+                $call = $calls[$index]
+                $call.id += [string](Get-Prop $part 'id' '')
+                $type = Get-Prop $part 'type'
+                if ($type -and $type -cne 'function') { throw "Unsupported streamed tool type '$type'." }
+                $fn = Get-Prop $part 'function'
+                $call.function.name += [string](Get-Prop $fn 'name' '')
+                $call.function.arguments += [string](Get-Prop $fn 'arguments' '')
+            }
+            $reason = Get-Prop $choice 'finish_reason'
+            if ($reason) { $finish = $reason }
+        }
+    }
+    if (-not $done -or -not $finish) { throw 'Incomplete OpenAI stream: missing finish_reason or [DONE].' }
+    $message = @{ role = 'assistant'; content = $text }
+    if ($reasoning) { $message.reasoning = $reasoning }
+    if ($calls.Count) { $message.tool_calls = @($calls.Keys | Sort-Object | ForEach-Object { $calls[$_] }) }
+    return [pscustomobject]@{ Message = $message; FinishReason = $finish }
+}
+
+function Invoke-OpenAiStream {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][hashtable]$Body,
+        [Parameter(Mandatory)][int]$TimeoutSec
+    )
+
+    $response = Invoke-WebRequest -Uri "$Uri/v1/chat/completions" -Method Post `
+        -Body ($Body | ConvertTo-Json -Depth 20) -ContentType 'application/json' `
+        -Headers @{ Authorization = 'Bearer ollama' } -TimeoutSec $TimeoutSec -ErrorAction Stop
+    if ([string]$response.Headers['Content-Type'] -notlike 'text/event-stream*') {
+        throw 'The server did not return text/event-stream for a streaming request.'
+    }
+    # Buffer a bounded smoke-test response, then reconstruct the actual SSE deltas.
+    $content = $response.Content
+    if ($content -is [byte[]]) { $content = [Text.Encoding]::UTF8.GetString($content) }
+    return ConvertFrom-OpenAiEventStream -Content $content
+}
+
 function Invoke-OpenAiToolCheck {
-    <#
-        .SYNOPSIS
-            Same check against /v1/chat/completions - the endpoint agent harnesses use.
-    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Uri,
@@ -295,34 +378,53 @@ function Invoke-OpenAiToolCheck {
 
     $body = @{
         model       = $ModelTag
-        stream      = $false
+        stream      = $true
+        max_tokens  = 1024
         temperature = 0
         tools       = @(New-WeatherTool | ForEach-Object { $_ })
         tool_choice = 'auto'
         messages    = @(
             @{ role = 'user'; content = 'What is the weather in Prague right now?' }
         )
-    } | ConvertTo-Json -Depth 20
-
-    $headers = @{ Authorization = 'Bearer ollama' }  # shim ignores the value but some clients require the header
-
-    $response = Invoke-RestMethod -Uri "$Uri/v1/chat/completions" -Method Post -Body $body `
-        -ContentType 'application/json' -Headers $headers -TimeoutSec $TimeoutSec -ErrorAction Stop
-
-    $choices = @(Get-Prop -InputObject $response -Name 'choices' -Default @())
-    if ($choices.Count -eq 0) {
-        return [pscustomobject]@{ Ok = $false; Detail = '/v1 returned no choices' }
     }
 
-    $message = Get-Prop -InputObject $choices[0] -Name 'message'
-    $toolCalls = @(Get-Prop -InputObject $message -Name 'tool_calls' -Default @())
-    if ($toolCalls.Count -eq 0) {
-        return [pscustomobject]@{ Ok = $false; Detail = 'model replied with text instead of a tool call' }
+    $response = Invoke-OpenAiStream -Uri $Uri -Body $body -TimeoutSec $TimeoutSec
+    $message = $response.Message
+    $toolCalls = @()
+    if ($message.ContainsKey('tool_calls')) { $toolCalls = @($message.tool_calls) }
+    if ($toolCalls.Count -ne 1 -or $response.FinishReason -cne 'tool_calls') {
+        return [pscustomobject]@{ Ok = $false; Detail = 'stream did not finish with one weather tool call' }
     }
+    $call = $toolCalls[0]
+    $shape = Test-ToolCallShape -FunctionName $call.function.name -Arguments $call.function.arguments
+    if (-not $shape.Ok) { return $shape }
+    if ([string]::IsNullOrWhiteSpace($call.id)) {
+        return [pscustomobject]@{ Ok = $false; Detail = 'streamed tool call has no id for the tool reply' }
+    }
+    $body.messages += $message
+    $body.messages += @{
+        role = 'tool'; tool_call_id = $call.id
+        content = '{"location":"Prague","temperature":17,"unit":"celsius","condition":"sunny","synthetic_test_data":true}'
+    }
+    $body.messages += @{ role = 'user'; content = 'Report the temperature in Celsius from the tool result in one short sentence. Do not call another tool.' }
+    $body.tool_choice = 'none'
+    $reply = Invoke-OpenAiStream -Uri $Uri -Body $body -TimeoutSec $TimeoutSec
+    if ($reply.FinishReason -cne 'stop' -or $reply.Message.ContainsKey('tool_calls') -or
+        $reply.Message.content -notmatch '\b17\b') {
+        return [pscustomobject]@{ Ok = $false; Detail = 'tool-result continuation did not finish with the supplied temperature (17 C)' }
+    }
+    return [pscustomobject]@{ Ok = $true; Detail = "$($shape.Detail); streaming and synthetic tool-result round trip passed" }
+}
 
-    $fn = Get-Prop -InputObject $toolCalls[0] -Name 'function'
-    return Test-ToolCallShape -FunctionName ([string](Get-Prop -InputObject $fn -Name 'name')) `
-        -Arguments (Get-Prop -InputObject $fn -Name 'arguments')
+function Get-ModelContextLength {
+    param([string]$Uri, [string]$ModelTag)
+
+    $running = Invoke-RestMethod -Uri "$Uri/api/ps" -TimeoutSec 10 -ErrorAction Stop
+    $models = @(Get-Prop $running 'models' @() | Where-Object { $_.name -ceq $ModelTag })
+    if ($models.Count -ne 1) { throw "Cannot inspect allocated context: '$ModelTag' is not resident." }
+    $context = Get-Prop $models[0] 'context_length'
+    if ($null -eq $context) { throw 'This Ollama version does not report context_length in /api/ps. Upgrade Ollama to check it.' }
+    return [int]$context
 }
 
 function Clear-LoadedModel {
@@ -338,7 +440,7 @@ function Clear-LoadedModel {
             -ContentType 'application/json' -TimeoutSec 30 -ErrorAction Stop
     }
     catch {
-        Write-Verbose "Unload request for $ModelTag failed: $(Get-HttpErrorDetail -ErrorRecord $_)"
+        throw "Unload request for $ModelTag failed: $(Get-HttpErrorDetail -ErrorRecord $_)"
     }
 }
 
@@ -365,18 +467,21 @@ Write-Host "    OK  server up, version $version" -ForegroundColor Green
 
 Write-Step 'Environment knobs'
 
-$knobs = [ordered]@{
-    OLLAMA_FLASH_ATTENTION   = '1'
-    OLLAMA_KV_CACHE_TYPE     = 'q8_0'
-    OLLAMA_KEEP_ALIVE        = '-1'
-    OLLAMA_MAX_LOADED_MODELS = '1'
+$knobs = Get-SavedOllamaEnvironment
+if ($knobs.Count -eq 0) {
+    $knobs = [ordered]@{
+        OLLAMA_FLASH_ATTENTION = $(if ($LocalAgentDefaults.FlashAttention) { '1' } else { '0' })
+        OLLAMA_KV_CACHE_TYPE = $LocalAgentDefaults.KvCacheType
+        OLLAMA_KEEP_ALIVE = $LocalAgentDefaults.KeepAlive
+        OLLAMA_MAX_LOADED_MODELS = [string]$LocalAgentDefaults.MaxLoadedModels
+    }
 }
 
 # Read the server process itself. Checking this shell's environment would only tell
 # you about this shell - the server runs under launchd and never saw it.
-$serverEnv = Get-OllamaServerEnvironment
+$serverEnv = Get-OllamaServerEnvironment -BaseUrl $BaseUrl
 if ($serverEnv.Source -eq 'none') {
-    Write-Host '    --  could not read the server environment (no server process found)' -ForegroundColor DarkYellow
+    Write-Host '    --  server environment unavailable (remote/non-Mac endpoint or no readable process); not verified' -ForegroundColor DarkYellow
 }
 else {
     Write-Host "    source: $($serverEnv.Source)" -ForegroundColor DarkGray
@@ -406,8 +511,8 @@ foreach ($extra in $serverEnv.Values.GetEnumerator()) {
 }
 
 if ($missing.Count -gt 0) {
-    Write-Host '    The values above are what the *server* sees, which is the only reading' -ForegroundColor DarkGray
-    Write-Host '    that matters. Setting OLLAMA_* in a terminal does nothing. Apply them with:' -ForegroundColor DarkGray
+    Write-Host '    Environment diagnostics are advisory; a launchctl fallback is not proof of process settings.' -ForegroundColor DarkGray
+    Write-Host '    Apply the saved service configuration with:' -ForegroundColor DarkGray
     Write-Host '        ./scripts/Restart-Ollama.ps1' -ForegroundColor DarkGray
     Write-Host "    Missing or different: $($missing -join ', ')" -ForegroundColor DarkGray
 }
@@ -425,11 +530,16 @@ if ($installed.Count -eq 0) {
 }
 
 if ($Model) {
+    foreach ($pattern in $Model) {
+        if (@($installed | Where-Object { $_.name -clike $pattern }).Count -eq 0) {
+            throw "No installed model matched requested selector '$pattern'."
+        }
+    }
     $installed = @($installed | Where-Object {
             $name = $_.name
             # @(...) matters: a single match unwraps to a bare string, and .Count on
             # that throws under Set-StrictMode -Version Latest.
-            @($Model | Where-Object { $name -like $_ -or $name -eq $_ }).Count -gt 0
+            @($Model | Where-Object { $name -clike $_ }).Count -gt 0
         })
     if ($installed.Count -eq 0) {
         Write-Warning "No installed model matched: $($Model -join ', ')"
@@ -438,7 +548,7 @@ if ($Model) {
 }
 
 foreach ($m in $installed) {
-    $sizeGb = [math]::Round([double](Get-Prop -InputObject $m -Name 'size' -Default 0) / 1GB, 1)
+    $sizeGb = [math]::Round([double](Get-Prop -InputObject $m -Name 'size' -Default 0) / 1e9, 1)
     Write-Host "    $($m.name)  (${sizeGb}GB)" -ForegroundColor White
 }
 
@@ -453,7 +563,7 @@ $index = 0
 foreach ($m in $installed) {
     $index++
     $tag = $m.name
-    $sizeGb = [math]::Round([double](Get-Prop -InputObject $m -Name 'size' -Default 0) / 1GB, 1)
+    $sizeGb = [math]::Round([double](Get-Prop -InputObject $m -Name 'size' -Default 0) / 1e9, 1)
 
     Write-Host ''
     Write-Host "[$index/$($installed.Count)] $tag" -ForegroundColor Yellow
@@ -467,6 +577,7 @@ foreach ($m in $installed) {
         LoadSeconds     = $null
         ToolsNative     = 'skipped'
         ToolsOpenAi     = 'skipped'
+        ContextLength   = $null
         Notes           = @()
     }
 
@@ -485,9 +596,6 @@ foreach ($m in $installed) {
             Write-Host " FAILED  $detail" -ForegroundColor Red
             $row.Notes += "benchmark: $detail"
         }
-    }
-    else {
-        $row.Reachable = $true
     }
 
     if (-not $SkipToolCheck) {
@@ -511,9 +619,10 @@ foreach ($m in $installed) {
             $row.Notes += "tools(native): $detail"
         }
 
-        Write-Host '      tool-calling (OpenAI /v1)...' -NoNewline
+        Write-Host '      streamed tool call + result round trip (OpenAI /v1)...' -NoNewline
         try {
             $openai = Invoke-OpenAiToolCheck -Uri $BaseUrl -ModelTag $tag -TimeoutSec $TimeoutSeconds
+            $row.Reachable = $true
             $row.ToolsOpenAi = if ($openai.Ok) { 'pass' } else { 'FAIL' }
             if ($openai.Ok) {
                 Write-Host " pass  $($openai.Detail)" -ForegroundColor Green
@@ -531,8 +640,24 @@ foreach ($m in $installed) {
         }
     }
 
+    if ($MinimumContextLength) {
+        try {
+            $row.ContextLength = Get-ModelContextLength -Uri $BaseUrl -ModelTag $tag
+            if ($row.ContextLength -lt $MinimumContextLength) {
+                throw "Allocated context $($row.ContextLength) is below required $MinimumContextLength tokens."
+            }
+        }
+        catch {
+            $row.Notes += "context: $(Get-HttpErrorDetail $_)"
+            Write-Warning $row.Notes[-1]
+        }
+    }
     if ($UnloadAfterEach) {
-        Clear-LoadedModel -Uri $BaseUrl -ModelTag $tag
+        try { Clear-LoadedModel -Uri $BaseUrl -ModelTag $tag }
+        catch {
+            $row.Notes += "unload: $(Get-HttpErrorDetail $_)"
+            Write-Warning $row.Notes[-1]
+        }
     }
 
     $results.Add([pscustomobject]$row)
@@ -548,24 +673,26 @@ $results | Format-Table -AutoSize `
 @{ L = 'Size(GB)'; E = { '{0:0.#}' -f $_.SizeGb }; A = 'right' },
 @{ L = 'Tok/s'; E = { if ($null -ne $_.TokensPerSecond) { '{0:0.#}' -f $_.TokensPerSecond } else { '-' } }; A = 'right' },
 @{ L = 'Load(s)'; E = { if ($null -ne $_.LoadSeconds) { '{0:0.#}' -f $_.LoadSeconds } else { '-' } }; A = 'right' },
+@{ L = 'Context'; E = { if ($null -ne $_.ContextLength) { $_.ContextLength } else { '-' } } },
 @{ L = 'Tools/native'; E = { $_.ToolsNative } },
 @{ L = 'Tools/v1'; E = { $_.ToolsOpenAi } } | Out-Host
 
-$agentReady = @($results | Where-Object { $_.ToolsNative -eq 'pass' -and $_.ToolsOpenAi -eq 'pass' })
-$toolBroken = @($results | Where-Object { $_.ToolsNative -notin @('pass', 'skipped') -or $_.ToolsOpenAi -notin @('pass', 'skipped') })
+$agentReady = @($results | Where-Object { $_.ToolsNative -eq 'pass' -and $_.ToolsOpenAi -eq 'pass' -and $_.Notes.Count -eq 0 })
+$failed = @($results | Where-Object { $_.Notes.Count -gt 0 })
 
-Write-Host "  Agent-ready models (tool-calling verified on both endpoints): $($agentReady.Count)/$($results.Count)" -ForegroundColor White
+Write-Host "  Tool smoke checks passed (native + streamed OpenAI round trip): $($agentReady.Count)/$($results.Count)" -ForegroundColor White
+Write-Host '  This does not certify long-context quality, real-task reliability, or the Responses API.' -ForegroundColor DarkGray
 if ($agentReady.Count -gt 0) {
     $fastest = $agentReady | Where-Object { $null -ne $_.TokensPerSecond } | Sort-Object TokensPerSecond -Descending | Select-Object -First 1
     if ($fastest) {
-        Write-Host "  Fastest agent-ready model: $($fastest.Model) at $($fastest.TokensPerSecond) tok/s" -ForegroundColor Green
+        Write-Host "  Fastest passing model: $($fastest.Model) at $($fastest.TokensPerSecond) tok/s" -ForegroundColor Green
     }
 }
 
-if ($toolBroken.Count -gt 0) {
+if ($failed.Count -gt 0) {
     Write-Host ''
-    Write-Host '  Models with tool-calling problems - do not point an agent harness at these:' -ForegroundColor Red
-    foreach ($b in $toolBroken) {
+    Write-Host '  Requested checks failed:' -ForegroundColor Red
+    foreach ($b in $failed) {
         Write-Host "    $($b.Model)" -ForegroundColor Red
         foreach ($n in $b.Notes) { Write-Host "      - $n" -ForegroundColor DarkRed }
     }
@@ -590,5 +717,5 @@ if ($JsonPath) {
 }
 
 Write-Host ''
-if ($toolBroken.Count -gt 0) { exit 1 }
+if ($failed.Count -gt 0) { exit 1 }
 exit 0
