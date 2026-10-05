@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Local scratch / output from scripts
+out/
+scratch/
+*.local.json
+*.local.ps1
+benchmark-*.json
+benchmark-*.csv
+
+# Editor / tooling
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log

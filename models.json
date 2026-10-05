@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "verified_date": "2026-10-04",
+  "verified_against": "Ollama public model library",
+  "notes": [
+    "Model tags churn quickly. Re-verify against 'ollama search' / the Ollama library before trusting sizes.",
+    "size_gb is the on-disk download size of the default q4_K_M quantization unless stated otherwise.",
+    "Resident RAM while loaded is roughly size_gb plus KV cache, which grows with context length.",
+    "Tier membership is cumulative in intent: 'recommended' includes the 'minimal' model, 'full' includes everything."
+  ],
+  "ram_budget": {
+    "machine_unified_memory_gb": 48,
+    "usable_for_weights_gb": 34,
+    "rationale": "~8GB for macOS and background daemons, ~4GB for apps/browser, remainder reserved for KV cache at long agent context."
+  },
+  "defaults": {
+    "quantization": "q4_K_M",
+    "endpoint": "http://localhost:11434",
+    "openai_compatible_endpoint": "http://localhost:11434/v1"
+  },
+  "models": [
+    {
+      "name": "gemma4-e4b",
+      "tag": "gemma4:e4b",
+      "size_gb": 7.5,
+      "purpose": "general",
+      "tiers": ["minimal", "recommended", "full"],
+      "summary": "Tiny but genuinely usable. The 'airplane' model: loads fast, leaves headroom for everything else.",
+      "tool_calling": "yes",
+      "mlx_tag": null
+    },
+    {
+      "name": "qwen3-coder-30b",
+      "tag": "qwen3-coder:30b",
+      "size_gb": 19,
+      "purpose": "coding",
+      "tiers": ["recommended", "full"],
+      "summary": "MoE with only ~3B active parameters, so it runs far faster than its 30B label suggests. The safe default daily driver.",
+      "tool_calling": "yes",
+      "mlx_tag": null
+    },
+    {
+      "name": "gpt-oss-20b",
+      "tag": "gpt-oss:20b",
+      "size_gb": 14,
+      "purpose": "general",
+      "tiers": ["recommended", "full"],
+      "summary": "OpenAI open-weight model. Strong, reliable tool-calling - the best first pick when an agent harness misbehaves.",
+      "tool_calling": "yes",
+      "mlx_tag": null
+    },
+    {
+      "name": "qwen3.6-27b-coding",
+      "tag": "qwen3.6:27b-coding",
+      "size_gb": 17,
+      "purpose": "coding",
+      "tiers": ["full"],
+      "summary": "Coding-tuned variant of the Qwen 3.6 generation.",
+      "tool_calling": "yes",
+      "mlx_tag": "qwen3.6:27b-mlx"
+    },
+    {
+      "name": "devstral-small-2-24b",
+      "tag": "devstral-small-2:24b",
+      "size_gb": 15,
+      "purpose": "agentic-coding",
+      "tiers": ["full"],
+      "summary": "Purpose-built for agentic loops (plan / call tool / observe / repeat) rather than single-shot completion.",
+      "tool_calling": "yes",
+      "mlx_tag": null
+    },
+    {
+      "name": "qwen3.8-27b",
+      "tag": "qwen3.8:27b",
+      "size_gb": 18,
+      "purpose": "general",
+      "tiers": ["full"],
+      "summary": "Newest Qwen generation. Best general reasoning in the set that still fits comfortably.",
+      "tool_calling": "yes",
+      "mlx_tag": "qwen3.8:27b-mlx"
+    },
+    {
+      "name": "gemma4-26b",
+      "tag": "gemma4:26b",
+      "size_gb": 16,
+      "purpose": "general-multimodal",
+      "tiers": ["full"],
+      "summary": "Google's multimodal model - accepts images as well as text.",
+      "tool_calling": "yes",
+      "mlx_tag": null
+    }
+  ],
+  "out_of_range": [
+    {
+      "tag": "qwen3-coder-next",
+      "size_gb": 52,
+      "reason": "Exceeds the ~34GB weight budget on a 48GB machine. Needs 64GB+."
+    },
+    {
+      "tag": "gpt-oss:120b",
+      "size_gb": 65,
+      "reason": "Exceeds the ~34GB weight budget on a 48GB machine. Needs 96GB+."
+    },
+    {
+      "tag": "devstral-2",
+      "size_gb": 75,
+      "reason": "Exceeds the ~34GB weight budget on a 48GB machine. Needs 96GB+."
+    },
+    {
+      "tag": "qwen3-coder:480b",
+      "size_gb": 290,
+      "reason": "Far beyond any single-machine Apple Silicon configuration currently sold."
+    },
+    {
+      "tag": "glm-5.3-flash",
+      "size_gb": null,
+      "reason": "Cloud-only. No local weights exist - it cannot be run with Ollama at any memory size."
+    }
+  ]
+}
