@@ -28,7 +28,7 @@ $BaseUrl = Resolve-LocalAgentBaseUrl -BaseUrl $BaseUrl
 $version = Get-OllamaVersion -BaseUrl $BaseUrl
 if (-not $version) {
     Write-Host "Ollama is not reachable at $BaseUrl" -ForegroundColor Red
-    Write-Host '  Start it with: ./scripts/Start-Ollama.ps1' -ForegroundColor Yellow
+    Write-Host "  $(Get-OllamaStartHint -BaseUrl $BaseUrl)" -ForegroundColor Yellow
     return
 }
 
@@ -44,7 +44,9 @@ if ($serverEnv.Values.Count -gt 0) {
 }
 else {
     Write-Host "  No environment values available (source: $($serverEnv.Source)); settings are not verified." -ForegroundColor DarkGray
-    Write-Host '  Apply them with: ./scripts/Restart-Ollama.ps1' -ForegroundColor DarkGray
+    if (Test-LocalMacEndpoint $BaseUrl) {
+        Write-Host '  Apply them with: ./scripts/Restart-Ollama.ps1' -ForegroundColor DarkGray
+    }
 }
 
 try {

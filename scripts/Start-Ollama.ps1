@@ -1,9 +1,13 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Saves the performance knobs in a persistent service plist and starts Ollama.
+    Starts Ollama via Homebrew on macOS or the packaged systemd service on Fedora.
 
 .DESCRIPTION
+    On Fedora 42+, starts the existing systemd service without changing tuning or boot
+    policy. On Windows, open the native Ollama app instead; no process supervisor is added.
+    The tuning and -AtLogin options below apply only to macOS.
+
     Starts the brew-managed Ollama service on demand, after registering the environment
     knobs that the server actually reads. Omitted settings reuse saved values, falling
     back to _common.ps1 on the first run.
@@ -102,6 +106,17 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot/_common.ps1"
+
+if (-not $IsMacOS) {
+    if ($IsWindows) { throw 'On Windows, open Ollama from the Start menu. To restart, quit the tray app and reopen it. See docs/windows-fedora.md.' }
+    $macOptions = @('AtLogin', 'KeepAlive', 'KvCacheType', 'FlashAttention', 'ContextLength', 'MaxLoadedModels', 'NoEnvironment') |
+        Where-Object { $PSBoundParameters.ContainsKey($_) }
+    if ($macOptions) { throw "These options are macOS-only: $($macOptions -join ', '). Configure Fedora tuning with 'sudo systemctl edit ollama.service'." }
+    . "$PSScriptRoot/_fedora.ps1"
+    $action = if ($Restart) { 'restart' } else { 'start' }
+    Invoke-FedoraOllamaService -Action $action -BaseUrl (Resolve-LocalAgentBaseUrl $BaseUrl) -TimeoutSeconds $TimeoutSeconds
+    return
+}
 
 $settings = Get-OllamaServiceSettings
 if (-not $PSBoundParameters.ContainsKey('KeepAlive')) { $KeepAlive = $settings.KeepAlive }

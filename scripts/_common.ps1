@@ -105,6 +105,35 @@ function Resolve-OllamaModelTag {
     return $Tag
 }
 
+function Resolve-OllamaCommand {
+    $command = Get-Command ollama -ErrorAction SilentlyContinue
+    if ($command) {
+        if ($command.CommandType -in @('Application', 'ExternalScript')) { return $command.Source }
+        return $command.Name
+    }
+    # WinGet's installer updates the user PATH, not the current PowerShell process.
+    if ($IsWindows -and $env:LOCALAPPDATA) {
+        $path = Join-Path $env:LOCALAPPDATA 'Programs' 'Ollama' 'ollama.exe'
+        if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
+    }
+    return $null
+}
+
+function Test-LocalMacEndpoint {
+    param([string]$BaseUrl)
+    return ($IsMacOS -and ([uri](Resolve-LocalAgentBaseUrl $BaseUrl)).IsLoopback)
+}
+
+function Get-OllamaStartHint {
+    param([string]$BaseUrl)
+    if (-not ([uri](Resolve-LocalAgentBaseUrl $BaseUrl)).IsLoopback) {
+        return "Start Ollama on the server at $BaseUrl; local service commands do not manage it."
+    }
+    if ($IsMacOS) { return 'Start it with: ./scripts/Start-Ollama.ps1' }
+    if ($IsWindows) { return 'Open Ollama from the Windows Start menu. To restart, quit its tray app and reopen it.' }
+    return 'On Fedora, run ./scripts/Start-Ollama.ps1; otherwise start your native Ollama server.'
+}
+
 function Invoke-OllamaCli {
     [CmdletBinding()]
     param(
@@ -112,13 +141,12 @@ function Invoke-OllamaCli {
         [Parameter(Mandatory)][string[]]$ArgumentList
     )
 
-    if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
-        throw "The 'ollama' CLI was not found on PATH."
-    }
+    $command = Resolve-OllamaCommand
+    if (-not $command) { throw "The 'ollama' CLI was not found. Install Ollama and reopen your terminal to refresh PATH." }
     $savedHost = $env:OLLAMA_HOST
     try {
         $env:OLLAMA_HOST = Resolve-LocalAgentBaseUrl -BaseUrl $BaseUrl
-        & ollama @ArgumentList
+        & $command @ArgumentList
         if ($LASTEXITCODE -ne 0) { throw "ollama $($ArgumentList -join ' ') failed with exit code $LASTEXITCODE." }
     }
     finally {
@@ -163,7 +191,7 @@ function Test-OllamaReachable {
     if (Get-OllamaVersion -BaseUrl $BaseUrl -TimeoutSec $TimeoutSec) { return $true }
 
     Write-Host "Ollama is not reachable at $BaseUrl" -ForegroundColor Red
-    Write-Host '  Start it with: ./scripts/Start-Ollama.ps1' -ForegroundColor Yellow
+    Write-Host "  $(Get-OllamaStartHint -BaseUrl $BaseUrl)" -ForegroundColor Yellow
     return $false
 }
 
@@ -324,7 +352,7 @@ function Get-HttpErrorDetail {
 function Get-OllamaModelsPath {
     <#
         .SYNOPSIS
-            Directory holding the downloaded weights.
+            Local Mac model directory, or $null when server-side storage is unknown.
 
         .DESCRIPTION
             Defaults to ~/.ollama/models, which contains manifests/ (small JSON pointers)
@@ -336,9 +364,10 @@ function Get-OllamaModelsPath {
             process, not this shell - the server is what decides where files land.
     #>
     [CmdletBinding()]
-    param()
+    param([string]$BaseUrl = 'http://localhost:11434')
 
-    $serverEnv = Get-OllamaServerEnvironment
+    if (-not (Test-LocalMacEndpoint $BaseUrl)) { return $null }
+    $serverEnv = Get-OllamaServerEnvironment -BaseUrl $BaseUrl
     if ($serverEnv.Values.Contains('OLLAMA_MODELS')) {
         $override = $serverEnv.Values['OLLAMA_MODELS']
         if (-not [string]::IsNullOrWhiteSpace($override)) { return $override }
@@ -358,8 +387,9 @@ function Get-DirectorySizeBytes {
             difference trustworthy.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path)
+    param([AllowNull()][AllowEmptyString()][string]$Path)
 
+    if (-not $Path) { return $null }
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
 
     $output = & du -sk $Path 2>$null

@@ -1,7 +1,7 @@
 # local-agents
 
-A reproducible setup for running **local LLM agents on Apple Silicon Macs**, driven from
-PowerShell.
+A reproducible setup for running **local LLM agents, Mac-first**, driven from PowerShell.
+Windows (WinGet) and Fedora 42+ (DNF) can use the same model catalog and API scripts.
 
 It answers three questions:
 
@@ -10,11 +10,11 @@ It answers three questions:
 3. **How do you know it actually works before you rely on it?**
    ([`scripts/Test-LocalStack.ps1`](scripts/Test-LocalStack.ps1))
 
-Everything is PowerShell 7 (`pwsh`) on macOS. Model list verified **2026-10-04**.
+Everything is PowerShell 7 (`pwsh`), not Windows PowerShell 5.1. Model list verified **2026-10-04**.
 
 ---
 
-## Quick start
+## Quick start (Mac)
 
 ```powershell
 ./scripts/Install-LocalAgents.ps1           # brew install ollama + start it on demand
@@ -31,6 +31,24 @@ opts into always-on if you prefer. `Start-Ollama.ps1` also applies the tuning kn
 (flash attention, q8_0 KV cache, keep-alive until you stop it, one model resident at a
 time) to the service, which is the only way they
 actually take effect — see [docs/setup.md](docs/setup.md#3-environment-knobs).
+
+### Windows or Fedora: start with the existing minimal tier
+
+```powershell
+./scripts/Install-LocalAgents.ps1           # WinGet on Windows; DNF + systemd on Fedora
+# On Windows, open Ollama from the Start menu before continuing.
+./scripts/Sync-Models.ps1 -Tier minimal
+./scripts/Test-LocalStack.ps1 -Model 'gemma4:e4b'
+if ($LASTEXITCODE -ne 0) { throw 'Resolve the reported failure before starting an agent.' }
+./scripts/Start-LocalCopilot.ps1 -Model 'gemma4:e4b'
+```
+
+One manifest, no platform-specific models or profiles. Syncing `minimal` does **not**
+change the shared default model (`qwen3-coder:30b`); pass `-Model` on the PC.
+The Windows app manages its own lifecycle. Fedora start/stop/restart uses its packaged
+service without changing tuning or boot policy. Mac behavior is unchanged.
+See [Windows and Fedora setup](docs/windows-fedora.md) for prerequisites, native settings,
+uninstall behavior, and limitations.
 
 ### Then point an agent at it
 
@@ -173,8 +191,8 @@ Two things worth knowing that are not obvious:
 - **Check quantization per artifact.** Q4_K_M is a useful GGUF starting point, not a
   universal default: `gpt-oss:20b` uses MXFP4, and the listed MLX variants use NVFP4.
   Size/quality tradeoffs depend on the model and task.
-- **Ollama ships Apple-native MLX builds** (`qwen3.8:27b-mlx`, `qwen3.6:27b-mlx`) that are
-  meaningfully faster on M-series than the default llama.cpp path. Pull them with
+- **Ollama offers MLX variants** (`qwen3.8:27b-mlx`, `qwen3.6:27b-mlx`).
+  Check runtime/hardware compatibility and benchmark rather than assuming a speedup. Pull them with
   `./scripts/Sync-Models.ps1 -Tier full -UseMlx`.
 
 Model tags churn quickly. Re-verify sizes before trusting this table.
@@ -211,6 +229,7 @@ local-agents/
 ├── models.json                    # single source of truth for the model set
 ├── docs/
 │   ├── setup.md                   # install, env knobs, idle cost, troubleshooting
+│   ├── windows-fedora.md          # native package managers and the shared minimal workflow
 │   ├── models.md                  # sizes, RAM math, quantization, MLX
 │   ├── offline.md                 # pre-flight checklist before losing connectivity
 │   ├── harnesses.md               # Copilot app + CLI (BYOK), Aider, OpenCode, Continue, SDKs
@@ -219,19 +238,20 @@ local-agents/
     ├── Install-LocalAgents.ps1    # idempotent install + service start
     ├── Sync-Models.ps1            # reconcile local models against a models.json tier
     ├── Test-LocalStack.ps1        # health, tokens/sec, tool-calling verification
-    ├── Uninstall-LocalAgents.ps1  # clean revert incl. ~/.ollama
+    ├── Uninstall-LocalAgents.ps1  # native uninstall; Mac optionally removes ~/.ollama
     │
-    ├── Start-Ollama.ps1           # start on demand + apply env knobs (-AtLogin to register)
-    ├── Stop-Ollama.ps1            # stop and unregister
-    ├── Restart-Ollama.ps1         # restart, re-applying knobs - how you change a setting
+    ├── Start-Ollama.ps1           # Mac service + tuning; Fedora native service
+    ├── Stop-Ollama.ps1            # stop service; on Mac also unregister login startup
+    ├── Restart-Ollama.ps1         # restart service; on Mac re-apply saved tuning
     ├── Get-OllamaStatus.ps1       # server version + models resident in RAM
     ├── Get-LocalModel.ps1         # installed models with on-disk sizes
-    ├── Get-LocalAgentBudget.ps1   # this machine's weight budget
+    ├── Get-LocalAgentBudget.ps1   # Mac unified-memory weight budget
     ├── Dismount-LocalModel.ps1    # free resident model memory, server stays up
     ├── Remove-LocalModel.ps1      # delete weights from disk, reports space reclaimed
     ├── Invoke-LocalChat.ps1       # one-shot prompt from the terminal
     ├── Start-LocalCopilot.ps1     # Copilot CLI against local Ollama (BYOK)
-    └── _common.ps1                # internal: shared defaults + helpers, not run directly
+    ├── _common.ps1                # internal: shared defaults + helpers, not run directly
+    └── _fedora.ps1                # internal: DNF/systemd helpers, no custom service
 ```
 
 Sync skips existing tags; destructive operations prompt by default, including `-Prune`.
@@ -241,8 +261,8 @@ anywhere — they resolve their own dependencies via
 attention) live in one
 place: `scripts/_common.ps1`.
 
-Regression tests use Pester 5 and fake the server/Homebrew; they do not require model
-downloads or a running Ollama instance:
+Regression tests use Pester 5 and fake the server, package managers, and service control;
+they do not install software, download models, or require a running Ollama instance:
 
 ```powershell
 Invoke-Pester ./tests/LocalAgents.Tests.ps1
@@ -252,10 +272,10 @@ Invoke-Pester ./tests/LocalAgents.Tests.ps1
 
 ## Requirements
 
-- macOS on Apple Silicon (M-series). Intel Macs have no useful GPU path here.
-- [PowerShell 7+](https://github.com/PowerShell/PowerShell) (`brew install powershell`).
-- Homebrew at `/opt/homebrew`.
-- Disk: 7.5 GB (minimal tier) to ~107 GB (full tier).
+- Main platform: macOS on Apple Silicon (M-series) with Homebrew.
+- Optional: Windows with WinGet, or Fedora 42+ with DNF and systemd.
+- [PowerShell 7+](https://github.com/PowerShell/PowerShell) on every platform.
+- Disk: allow room for the selected models and runtime; manifest sizes are planning estimates.
 
 ---
 
@@ -263,8 +283,12 @@ Invoke-Pester ./tests/LocalAgents.Tests.ps1
 
 ```powershell
 ./scripts/Uninstall-LocalAgents.ps1 -WhatIf   # see what would go
-./scripts/Uninstall-LocalAgents.ps1           # stop service, uninstall, remove ~/.ollama
+./scripts/Uninstall-LocalAgents.ps1           # Mac: also removes ~/.ollama unless -KeepModels
 ```
+
+On Windows, quit Ollama first. Windows/Fedora uninstall uses the native package manager
+and does not delete model directories; remove unwanted models through the API before
+uninstalling. See [platform instructions](docs/windows-fedora.md#uninstall).
 
 ---
 

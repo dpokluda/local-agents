@@ -5,6 +5,9 @@ Target: macOS on Apple Silicon, with [PowerShell 7](https://github.com/PowerShel
 
 Prerequisite: Homebrew at `/opt/homebrew`. These scripts will not install Homebrew for you.
 
+This page describes the unchanged Mac lifecycle and tuning. For native WinGet/DNF
+installation and the shared minimal-model workflow, see [Windows and Fedora](windows-fedora.md).
+
 ---
 
 ## 1. Install

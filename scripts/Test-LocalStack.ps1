@@ -31,8 +31,9 @@
     Per-request timeout. Cold-loading a 19GB model can take a while on first touch.
 
 .PARAMETER KeepAlive
-    Value passed as Ollama's keep_alive for native test requests. Defaults to the saved
-    service setting, or the shared default. OpenAI requests use the server's setting.
+    Value passed as Ollama's keep_alive for native test requests. On a local Mac it defaults
+    to the saved/shared setting; elsewhere it is omitted to retain the server's policy.
+    OpenAI requests use the server's setting.
 
 .PARAMETER UnloadAfterEach
     Unload each model from memory after testing it. Use this when testing a large tier
@@ -96,7 +97,8 @@ $ErrorActionPreference = 'Stop'
 # before the local helpers below, so the script-specific versions win on name overlap.
 . "$PSScriptRoot/_common.ps1"
 $BaseUrl = Resolve-LocalAgentBaseUrl -BaseUrl $BaseUrl
-if (-not $KeepAlive) { $KeepAlive = (Get-OllamaServiceSettings).KeepAlive }
+$localMac = Test-LocalMacEndpoint $BaseUrl
+if (-not $KeepAlive -and $localMac) { $KeepAlive = (Get-OllamaServiceSettings).KeepAlive }
 
 $BenchmarkPrompt = 'Write a PowerShell one-liner that lists files larger than 10 MB under the current directory. Answer with the command and one sentence of explanation.'
 
@@ -230,17 +232,18 @@ function Invoke-Benchmark {
     param(
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][string]$ModelTag,
-        [Parameter(Mandatory)][string]$KeepAliveValue,
+        [string]$KeepAliveValue,
         [Parameter(Mandatory)][int]$TimeoutSec
     )
 
     $body = @{
         model      = $ModelTag
         stream     = $false
-        keep_alive = $KeepAliveValue
         messages   = @(@{ role = 'user'; content = $BenchmarkPrompt })
         options    = @{ temperature = 0; num_predict = 128 }
-    } | ConvertTo-Json -Depth 10
+    }
+    if ($KeepAliveValue) { $body.keep_alive = $KeepAliveValue }
+    $body = $body | ConvertTo-Json -Depth 10
 
     $response = Invoke-RestMethod -Uri "$Uri/api/chat" -Method Post -Body $body `
         -ContentType 'application/json' -TimeoutSec $TimeoutSec -ErrorAction Stop
@@ -266,14 +269,13 @@ function Invoke-NativeToolCheck {
     param(
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][string]$ModelTag,
-        [Parameter(Mandatory)][string]$KeepAliveValue,
+        [string]$KeepAliveValue,
         [Parameter(Mandatory)][int]$TimeoutSec
     )
 
     $body = @{
         model      = $ModelTag
         stream     = $false
-        keep_alive = $KeepAliveValue
         # Flatten-and-collect. This is the one wrapping idiom that yields a flat JSON
         # array whether New-WeatherTool returns ,@(x), @(x) or a bare x - a plain @(...)
         # around the comma idiom nests instead, and Ollama rejects both shapes.
@@ -282,7 +284,9 @@ function Invoke-NativeToolCheck {
             @{ role = 'user'; content = 'What is the weather in Prague right now?' }
         )
         options    = @{ temperature = 0 }
-    } | ConvertTo-Json -Depth 20
+    }
+    if ($KeepAliveValue) { $body.keep_alive = $KeepAliveValue }
+    $body = $body | ConvertTo-Json -Depth 20
 
     $response = Invoke-RestMethod -Uri "$Uri/api/chat" -Method Post -Body $body `
         -ContentType 'application/json' -TimeoutSec $TimeoutSec -ErrorAction Stop
@@ -457,8 +461,7 @@ catch {
     Write-Host "  Tried: $BaseUrl/api/version" -ForegroundColor Red
     Write-Host "  Error: $(Get-HttpErrorDetail -ErrorRecord $_)" -ForegroundColor Red
     Write-Host ''
-    Write-Host '  Try:  ./scripts/Start-Ollama.ps1' -ForegroundColor Yellow
-    Write-Host '  Or:   ollama serve' -ForegroundColor Yellow
+    Write-Host "  $(Get-OllamaStartHint -BaseUrl $BaseUrl)" -ForegroundColor Yellow
     exit 1
 }
 Write-Host "    OK  server up, version $version" -ForegroundColor Green
@@ -467,8 +470,9 @@ Write-Host "    OK  server up, version $version" -ForegroundColor Green
 
 Write-Step 'Environment knobs'
 
-$knobs = Get-SavedOllamaEnvironment
-if ($knobs.Count -eq 0) {
+$knobs = [ordered]@{}
+if ($localMac) { $knobs = Get-SavedOllamaEnvironment }
+if ($localMac -and $knobs.Count -eq 0) {
     $knobs = [ordered]@{
         OLLAMA_FLASH_ATTENTION = $(if ($LocalAgentDefaults.FlashAttention) { '1' } else { '0' })
         OLLAMA_KV_CACHE_TYPE = $LocalAgentDefaults.KvCacheType
@@ -525,7 +529,8 @@ $tags = Invoke-RestMethod -Uri "$BaseUrl/api/tags" -TimeoutSec 15 -ErrorAction S
 $installed = @(Get-Prop -InputObject $tags -Name 'models' -Default @())
 
 if ($installed.Count -eq 0) {
-    Write-Warning 'No models are installed. Run: ./scripts/Sync-Models.ps1 -Tier recommended'
+    $suggestedTier = if ($localMac) { 'recommended' } else { 'minimal' }
+    Write-Warning "No models are installed. Run: ./scripts/Sync-Models.ps1 -Tier $suggestedTier"
     exit 1
 }
 

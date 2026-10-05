@@ -4,6 +4,7 @@
 BeforeAll {
     $repo = Split-Path $PSScriptRoot -Parent
     . "$repo/scripts/_common.ps1"
+    . "$repo/scripts/_fedora.ps1"
     $ast = [System.Management.Automation.Language.Parser]::ParseFile(
         "$repo/scripts/Test-LocalStack.ps1", [ref]$null, [ref]$null)
     foreach ($fn in $ast.FindAll({
@@ -17,6 +18,14 @@ BeforeAll {
     function launchctl { param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments) }
     function plutil { param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments) }
     function sysctl { param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments) }
+    function winget { param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments) }
+    function dnf { param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments) }
+    function rpm { param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments) }
+    function sudo { param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments) }
+    function id { param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments) }
+    function systemctl { param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments) }
+    function copilot { param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments) }
+    function du { param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments) }
 
     function New-ToolStream {
         @'
@@ -340,6 +349,7 @@ Describe 'Budget and model pipeline' {
         $budget.WeightBudgetGb | Should -Be 26
         $budget.ComfortableModels | Should -Match 'qwen3-coder:30b'
     }
+
     It 'returns a Model property usable by removal through property binding' {
         Mock Invoke-RestMethod {
             if ($Uri -like '*/api/version') { return [pscustomobject]@{ version = 'test' } }
@@ -351,5 +361,305 @@ Describe 'Budget and model pipeline' {
         $binding = (Get-Command "$repo/scripts/Remove-LocalModel.ps1").Parameters['Model'].Attributes |
             Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] }
         $binding.ValueFromPipelineByPropertyName | Should -BeTrue
+    }
+}
+
+Describe 'Windows native installation' {
+    BeforeEach {
+        Set-Variable IsMacOS -Value $false -Force
+        Set-Variable IsWindows -Value $true -Force
+        Set-Variable IsLinux -Value $false -Force
+        $state = @{ Installed = $false }
+        Mock Resolve-OllamaCommand { if ($state.Installed) { 'ollama' } }
+        Mock winget {
+            $state.Installed = $Arguments[0] -eq 'install'
+            $global:LASTEXITCODE = 0
+        }
+        Mock Invoke-RestMethod { throw 'Server not running' }
+        Mock Get-SavedOllamaEnvironment { throw 'Must not read the Mac plist' }
+        Mock brew { throw 'Must not call Homebrew' }
+    }
+    It 'installs the exact WinGet package without changing Mac configuration' {
+        & "$repo/scripts/Install-LocalAgents.ps1"
+        Should -Invoke winget -Times 1 -ParameterFilter { ($Arguments -join ' ') -eq 'install --id Ollama.Ollama --exact --source winget' }
+        Should -Invoke Get-SavedOllamaEnvironment -Times 0
+        Should -Invoke brew -Times 0
+    }
+    It 'leaves an existing CLI alone' {
+        $state.Installed = $true
+        & "$repo/scripts/Install-LocalAgents.ps1" -SkipService
+        Should -Invoke winget -Times 0
+    }
+    It 'does not install or uninstall in WhatIf mode' {
+        & "$repo/scripts/Install-LocalAgents.ps1" -WhatIf
+        & "$repo/scripts/Uninstall-LocalAgents.ps1" -WhatIf
+        Should -Invoke winget -Times 0
+        Should -Invoke Invoke-RestMethod -Times 0
+    }
+    It 'rejects Mac-only options before installation' {
+        { & "$repo/scripts/Install-LocalAgents.ps1" -AtLogin } | Should -Throw '*macOS-only*'
+        { & "$repo/scripts/Install-LocalAgents.ps1" -InstallLmStudio } | Should -Throw '*macOS-only*'
+        Should -Invoke winget -Times 0
+    }
+    It 'propagates package-manager failures' {
+        Mock winget { $global:LASTEXITCODE = 9 }
+        { & "$repo/scripts/Install-LocalAgents.ps1" } | Should -Throw '*exit code 9*'
+        { & "$repo/scripts/Uninstall-LocalAgents.ps1" -Confirm:$false } | Should -Throw '*exit code 9*'
+    }
+    It 'does not claim the CLI is usable when WinGet returns success without it' {
+        Mock winget { $global:LASTEXITCODE = 0 }
+        { & "$repo/scripts/Install-LocalAgents.ps1" } | Should -Throw '*CLI was not found*'
+    }
+    It 'refuses an uninstall while the server is answering' {
+        Mock Invoke-RestMethod { [pscustomobject]@{ version = 'test' } }
+        { & "$repo/scripts/Uninstall-LocalAgents.ps1" -Confirm:$false } | Should -Throw '*Quit the Ollama tray*'
+        Should -Invoke winget -Times 0
+    }
+    It 'requests silent uninstall without the vendor model-deletion checkbox' {
+        Mock Remove-Item { throw 'Must not delete directories' }
+        & "$repo/scripts/Uninstall-LocalAgents.ps1" -Confirm:$false
+        Should -Invoke winget -Times 1 -ParameterFilter { ($Arguments -join ' ') -eq 'uninstall --id Ollama.Ollama --exact --silent' }
+        Should -Invoke Remove-Item -Times 0
+    }
+    It 'gives native app guidance instead of pretending to manage a Windows service' {
+        { & "$repo/scripts/Start-Ollama.ps1" } | Should -Throw '*Start menu*'
+        { & "$repo/scripts/Restart-Ollama.ps1" } | Should -Throw '*tray app*'
+        { & "$repo/scripts/Stop-Ollama.ps1" } | Should -Throw '*tray menu*'
+        Should -Invoke Get-SavedOllamaEnvironment -Times 0
+    }
+}
+
+Describe 'Windows CLI lookup and explicit model choice' {
+    BeforeEach {
+        Set-Variable IsMacOS -Value $false -Force
+        Set-Variable IsWindows -Value $true -Force
+        Set-Variable IsLinux -Value $false -Force
+    }
+    It 'finds the standard installed executable before PATH is refreshed' {
+        Mock Get-Command { $null } -ParameterFilter { $Name -eq 'ollama' }
+        $saved = $env:LOCALAPPDATA
+        try {
+            $env:LOCALAPPDATA = $TestDrive
+            $directory = Join-Path $TestDrive 'Programs' 'Ollama'
+            $null = New-Item -ItemType Directory $directory -Force
+            $path = Join-Path $directory 'ollama.exe'
+            Set-Content $path ''
+            Resolve-OllamaCommand | Should -Be $path
+        }
+        finally { $env:LOCALAPPDATA = $saved }
+    }
+    It 'launches the explicitly selected minimal model and restores provider settings' {
+        $state = @{ Model = $null; WireApi = $null }
+        $saved = $env:COPILOT_PROVIDER_MODEL_ID
+        Mock Get-Command { [pscustomobject]@{ Source = 'copilot' } } -ParameterFilter { $Name -eq 'copilot' }
+        Mock copilot {
+            $state.Model = $env:COPILOT_PROVIDER_MODEL_ID
+            $state.WireApi = $env:COPILOT_PROVIDER_WIRE_API
+        }
+        Mock Invoke-RestMethod {
+            if ($Uri -like '*/api/version') { return [pscustomobject]@{ version = 'test' } }
+            [pscustomobject]@{ models = @([pscustomobject]@{ name = 'gemma4:e4b' }) }
+        }
+        & "$repo/scripts/Start-LocalCopilot.ps1" -Model 'gemma4:e4b'
+        $state.Model | Should -Be 'gemma4:e4b'
+        $state.WireApi | Should -Be 'completions'
+        $env:COPILOT_PROVIDER_MODEL_ID | Should -Be $saved
+        $LocalAgentDefaults.Model | Should -Be 'qwen3-coder:30b'
+    }
+}
+
+Describe 'Fedora package and service paths' {
+    BeforeEach {
+        Set-Variable IsMacOS -Value $false -Force
+        Set-Variable IsWindows -Value $false -Force
+        Set-Variable IsLinux -Value $true -Force
+        $state = @{ Installed = $false; Active = $false; Answering = $false }
+        Mock Get-Content { "ID=fedora`nVERSION_ID=43`n" } -ParameterFilter { $LiteralPath -eq '/etc/os-release' }
+        Mock Resolve-OllamaCommand { $null }
+        Mock rpm { $global:LASTEXITCODE = if ($state.Installed) { 0 } else { 1 } }
+        Mock id { $global:LASTEXITCODE = 0; '1000' }
+        Mock dnf { $state.Installed = $Arguments[0] -eq 'install'; $global:LASTEXITCODE = 0 }
+        Mock sudo {
+            $command = $Arguments[0]
+            $forward = @($Arguments | Select-Object -Skip 1)
+            & $command @forward
+        }
+        Mock systemctl {
+            if ($Arguments[0] -eq 'is-active') {
+                $global:LASTEXITCODE = if ($state.Active) { 0 } else { 3 }
+            }
+            else {
+                $state.Active = $Arguments[0] -in @('start', 'restart')
+                $state.Answering = $state.Active
+                $global:LASTEXITCODE = 0
+            }
+        }
+        Mock Invoke-RestMethod {
+            if ($state.Answering) { return [pscustomobject]@{ version = 'test' } }
+            throw 'Server not running'
+        }
+        Mock Wait-OllamaApi { if ($state.Answering) { 'test' } }
+        Mock Get-SavedOllamaEnvironment { throw 'Must not read the Mac plist' }
+    }
+    It 'uses DNF and starts the packaged service without changing boot policy' {
+        & "$repo/scripts/Install-LocalAgents.ps1"
+        $state.Installed | Should -BeTrue
+        $state.Active | Should -BeTrue
+        Should -Invoke sudo -Times 1 -ParameterFilter { ($Arguments -join ' ') -eq 'dnf install ollama' }
+        Should -Invoke systemctl -Times 1 -ParameterFilter { ($Arguments -join ' ') -eq 'start ollama.service' }
+        Should -Invoke systemctl -Times 0 -ParameterFilter { $Arguments[0] -in @('enable', 'disable') }
+        Should -Invoke Get-SavedOllamaEnvironment -Times 0
+    }
+    It 'can skip starting the service' {
+        & "$repo/scripts/Install-LocalAgents.ps1" -SkipService
+        $state.Installed | Should -BeTrue
+        Should -Invoke systemctl -Times 0
+    }
+    It 'is non-mutating in WhatIf mode, even before the RPM is installed' {
+        & "$repo/scripts/Install-LocalAgents.ps1" -WhatIf
+        & "$repo/scripts/Restart-Ollama.ps1" -WhatIf
+        $state.Installed = $true
+        & "$repo/scripts/Uninstall-LocalAgents.ps1" -WhatIf
+        Should -Invoke sudo -Times 0
+        Should -Invoke dnf -Times 0
+        Should -Invoke systemctl -Times 0 -ParameterFilter { $Arguments[0] -ne 'is-active' }
+    }
+    It 'does not use sudo when already root' {
+        Mock id { $global:LASTEXITCODE = 0; '0' }
+        & "$repo/scripts/Install-LocalAgents.ps1" -SkipService
+        Should -Invoke dnf -Times 1
+        Should -Invoke sudo -Times 0
+    }
+    It 'rejects unsupported distributions and old Fedora versions before mutations' {
+        Mock Get-Content { "ID=ubuntu`nVERSION_ID=44`n" } -ParameterFilter { $LiteralPath -eq '/etc/os-release' }
+        { & "$repo/scripts/Install-LocalAgents.ps1" } | Should -Throw '*Fedora 42*'
+        Mock Get-Content { "ID=fedora`nVERSION_ID=41`n" } -ParameterFilter { $LiteralPath -eq '/etc/os-release' }
+        { & "$repo/scripts/Install-LocalAgents.ps1" } | Should -Throw '*Fedora 42*'
+        Should -Invoke sudo -Times 0
+    }
+    It 'accepts quoted Fedora release fields' {
+        Mock Get-Content { "ID=`"fedora`"`nVERSION_ID=`"42`"`n" } -ParameterFilter { $LiteralPath -eq '/etc/os-release' }
+        { Assert-FedoraHost } | Should -Not -Throw
+    }
+    It 'distinguishes a failed RPM query from a missing package' {
+        Mock rpm { $global:LASTEXITCODE = 2 }
+        { & "$repo/scripts/Install-LocalAgents.ps1" } | Should -Throw '*rpm could not query*'
+        Should -Invoke sudo -Times 0
+    }
+    It 'does not overwrite a non-RPM installation' {
+        Mock Resolve-OllamaCommand { '/opt/ollama/bin/ollama' }
+        { & "$repo/scripts/Install-LocalAgents.ps1" } | Should -Throw '*outside the Fedora*'
+        Should -Invoke sudo -Times 0
+    }
+    It 'stops on DNF failure rather than starting the service' {
+        Mock dnf { $global:LASTEXITCODE = 9 }
+        { & "$repo/scripts/Install-LocalAgents.ps1" } | Should -Throw '*exit code 9*'
+        Should -Invoke systemctl -Times 0
+    }
+    It 'restarts and stops without enabling or disabling boot startup' {
+        $state.Installed = $true
+        $state.Active = $true
+        $state.Answering = $true
+        & "$repo/scripts/Restart-Ollama.ps1"
+        & "$repo/scripts/Stop-Ollama.ps1"
+        Should -Invoke systemctl -Times 1 -ParameterFilter { $Arguments[0] -eq 'restart' }
+        Should -Invoke systemctl -Times 1 -ParameterFilter { $Arguments[0] -eq 'stop' }
+        Should -Invoke systemctl -Times 0 -ParameterFilter { $Arguments[0] -in @('enable', 'disable') }
+    }
+    It 'rejects remote service control, Mac tuning, and foreign servers' {
+        $state.Installed = $true
+        { & "$repo/scripts/Start-Ollama.ps1" -BaseUrl 'http://remote-test:11434' } | Should -Throw '*loopback*'
+        { & "$repo/scripts/Restart-Ollama.ps1" -ContextLength 65536 } | Should -Throw '*macOS-only*'
+        { & "$repo/scripts/Start-Ollama.ps1" -AtLogin } | Should -Throw '*macOS-only*'
+        $state.Answering = $true
+        { & "$repo/scripts/Start-Ollama.ps1" } | Should -Throw '*externally managed*'
+        Should -Invoke sudo -Times 0
+    }
+    It 'stops on service failure and does not claim readiness' {
+        $state.Installed = $true
+        Mock sudo { $global:LASTEXITCODE = 9 }
+        { & "$repo/scripts/Start-Ollama.ps1" } | Should -Throw '*exit code 9*'
+        Should -Invoke Wait-OllamaApi -Times 0
+    }
+    It 'removes the RPM after stopping but never deletes model directories' {
+        $state.Installed = $true
+        $state.Active = $true
+        $state.Answering = $true
+        Mock Remove-Item { throw 'Must not delete directories' }
+        & "$repo/scripts/Uninstall-LocalAgents.ps1" -Confirm:$false
+        $state.Installed | Should -BeFalse
+        $state.Active | Should -BeFalse
+        Should -Invoke dnf -Times 1 -ParameterFilter { ($Arguments -join ' ') -eq 'remove ollama' }
+        Should -Invoke Remove-Item -Times 0
+    }
+    It 'does not uninstall if the API still answers after stopping the service' {
+        $state.Installed = $true
+        $state.Active = $true
+        $state.Answering = $true
+        Mock systemctl { $global:LASTEXITCODE = 0 }
+        { & "$repo/scripts/Uninstall-LocalAgents.ps1" -Confirm:$false } | Should -Throw '*still answers*'
+        Should -Invoke dnf -Times 0
+    }
+}
+
+Describe 'Portable client diagnostics' {
+    BeforeEach {
+        Mock Get-SavedOllamaEnvironment { throw 'Must not read local saved settings' }
+        Mock du { throw 'Must not measure client disk' }
+    }
+    It 'continues to use saved keep-alive for a local Mac' {
+        Set-Variable IsMacOS -Value $true -Force
+        Mock Get-SavedOllamaEnvironment { [ordered]@{ OLLAMA_KEEP_ALIVE = '20m' } }
+        Mock Get-OllamaServerEnvironment { @{ Source = 'none'; Values = [ordered]@{} } }
+        $state = @{ Body = $null }
+        Mock Invoke-RestMethod {
+            if ($Uri -like '*/api/version') { return [pscustomobject]@{ version = 'test' } }
+            if ($Uri -like '*/api/tags') { return [pscustomobject]@{ models = @([pscustomobject]@{ name = 'test:latest'; size = 100 }) } }
+            $state.Body = $Body | ConvertFrom-Json
+            [pscustomobject]@{ eval_count = 50; eval_duration = 1000000000 }
+        }
+        & "$repo/scripts/Test-LocalStack.ps1" -SkipToolCheck -BaseUrl 'http://localhost:11434'
+        $LASTEXITCODE | Should -Be 0
+        $state.Body.keep_alive | Should -Be '20m'
+    }
+    It 'leaves native keep-alive alone and skips Mac diagnostics on <Platform>' -ForEach @(
+        @{ Platform = 'Windows'; Mac = $false; Windows = $true; Linux = $false; Endpoint = 'http://localhost:11434' }
+        @{ Platform = 'Fedora'; Mac = $false; Windows = $false; Linux = $true; Endpoint = 'http://localhost:11434' }
+        @{ Platform = 'remote from Mac'; Mac = $true; Windows = $false; Linux = $false; Endpoint = 'http://remote-test:11434' }
+    ) {
+        Set-Variable IsMacOS -Value $Mac -Force
+        Set-Variable IsWindows -Value $Windows -Force
+        Set-Variable IsLinux -Value $Linux -Force
+        $state = @{ Body = $null }
+        Mock Invoke-RestMethod {
+            if ($Uri -like '*/api/version') { return [pscustomobject]@{ version = 'test' } }
+            if ($Uri -like '*/api/tags') { return [pscustomobject]@{ models = @([pscustomobject]@{ name = 'test:latest'; size = 100 }) } }
+            $state.Body = $Body | ConvertFrom-Json
+            [pscustomobject]@{ eval_count = 50; eval_duration = 1000000000 }
+        }
+        & "$repo/scripts/Test-LocalStack.ps1" -SkipToolCheck -BaseUrl $Endpoint
+        $LASTEXITCODE | Should -Be 0
+        $state.Body.PSObject.Properties.Name | Should -Not -Contain 'keep_alive'
+        & "$repo/scripts/Test-LocalStack.ps1" -SkipToolCheck -KeepAlive '0' -BaseUrl $Endpoint
+        $state.Body.keep_alive | Should -Be '0'
+        Should -Invoke Get-SavedOllamaEnvironment -Times 0
+    }
+    It 'deletes through the selected API and reports unknown disk savings on <Platform>' -ForEach @(
+        @{ Platform = 'Windows'; Mac = $false; Endpoint = 'http://localhost:11434' }
+        @{ Platform = 'remote Mac'; Mac = $true; Endpoint = 'http://remote-test:11434' }
+    ) {
+        Set-Variable IsMacOS -Value $Mac -Force
+        $state = @{ DeletedAt = $null }
+        Mock Invoke-RestMethod {
+            if ($Uri -like '*/api/version') { return [pscustomobject]@{ version = 'test' } }
+            if ($Uri -like '*/api/ps') { return [pscustomobject]@{ models = @() } }
+            if ($Method -eq 'Delete') { $state.DeletedAt = $Uri; return }
+            [pscustomobject]@{ models = @([pscustomobject]@{ name = 'test:latest'; size = 100 }) }
+        }
+        $output = & "$repo/scripts/Remove-LocalModel.ps1" -Model 'test:latest' -BaseUrl $Endpoint -Confirm:$false 6>&1 | Out-String
+        $state.DeletedAt | Should -Be "$Endpoint/api/delete"
+        $output | Should -Match 'Reclaimed: unknown'
+        Should -Invoke du -Times 0
+        Should -Invoke Get-SavedOllamaEnvironment -Times 0
     }
 }

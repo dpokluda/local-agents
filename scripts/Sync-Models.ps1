@@ -139,7 +139,7 @@ $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
 Write-Host "    Manifest reference date: $($manifest.verified_date) ($($manifest.verified_against))." -ForegroundColor DarkGray
 Write-Host '    Sizes are planning estimates, not pinned artifacts. Installed bytes may differ.' -ForegroundColor DarkGray
 
-$memoryBudgetGb = $manifest.ram_budget.usable_for_weights_gb
+$memoryBudgetGb = if (Test-LocalMacEndpoint $BaseUrl) { $manifest.ram_budget.usable_for_weights_gb } else { $null }
 
 # --- Resolve the desired set --------------------------------------------------
 
@@ -221,12 +221,15 @@ if (@($plan | Where-Object { $null -eq $_.SizeGb }).Count -gt 0) {
 Write-Host "    To download: $($toPull.Count) model(s), roughly ${pullGb}GB." -ForegroundColor White
 Write-Host "    Set total on disk when complete: roughly ${totalGb}GB." -ForegroundColor White
 
-$oversized = @($plan | Where-Object { $null -ne $_.SizeGb -and ($_.SizeGb * 1e9) -gt ($memoryBudgetGb * 1GB) })
+$oversized = @($plan | Where-Object { $null -ne $memoryBudgetGb -and $null -ne $_.SizeGb -and ($_.SizeGb * 1e9) -gt ($memoryBudgetGb * 1GB) })
 foreach ($o in $oversized) {
     Write-Warning "$($o.Tag) is estimated at $($o.SizeGb)GB, above the manifest's ${memoryBudgetGb}GiB planning budget. It may fail to load or run slowly."
 }
 
-if (($totalGb * 1e9) -gt ($memoryBudgetGb * 1GB)) {
+if ($null -eq $memoryBudgetGb) {
+    Write-Host '    The manifest memory budget is Mac-specific; memory fit on this target is not evaluated.' -ForegroundColor DarkGray
+}
+elseif (($totalGb * 1e9) -gt ($memoryBudgetGb * 1GB)) {
     Write-Host "    Note: the set totals more than the ${memoryBudgetGb}GiB RAM budget. That is fine on disk - just do not expect to hold them all resident at once." -ForegroundColor DarkGray
 }
 

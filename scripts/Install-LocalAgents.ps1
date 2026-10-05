@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Installs and starts the local LLM agent stack (Homebrew + Ollama) on an Apple Silicon Mac.
+    Installs Ollama using Homebrew on macOS, WinGet on Windows, or DNF on Fedora.
 
 .DESCRIPTION
     Idempotent installer. Safe to re-run: every step checks current state before acting.
@@ -18,21 +18,27 @@
 
     This script deliberately does NOT pull any models. Run Sync-Models.ps1 for that.
 
+    On Windows, use the standard Ollama app; this script does not create a service or
+    manage the tray app. On Fedora 42+, start the packaged systemd service without
+    changing its boot policy or tuning. Mac-specific options are rejected on other hosts.
+
 .PARAMETER InstallLmStudio
-    Also install the LM Studio desktop app (cask). Optional GUI front end with an
+    macOS only. Also install the LM Studio desktop app (cask). Optional GUI front end with an
     Apple-Silicon-native MLX backend. Not required for any script in this repo.
 
 .PARAMETER SkipService
-    Install the formula but do not start the background service. Use this if you prefer
-    to run 'ollama serve' manually in a terminal.
+    Do not start the Mac/Fedora service. On Windows, skip the API status check; the
+    vendor installer may still launch its own app. No server is launched by this script.
 
 .PARAMETER AtLogin
+    macOS only.
     Start the service with 'brew services start' instead of 'brew services run', which
     also registers a launchd login item so Ollama comes back after every reboot. The
     default is deliberately on-demand: an idle server costs little, but it is still a
     background process you did not ask for, and a model left resident is not.
 
 .PARAMETER NoEnvironment
+    macOS only.
     Do not rewrite the saved service configuration. Reuse it if present; otherwise use
     Homebrew's defaults. Mainly useful if you manage the environment yourself.
 
@@ -60,7 +66,8 @@
     Same, but also registers Ollama to start automatically at every login.
 
 .NOTES
-    Reverse with ./scripts/Uninstall-LocalAgents.ps1.
+    Reverse with ./scripts/Uninstall-LocalAgents.ps1. See docs/windows-fedora.md for the
+    native app/service workflow and preserved model data on Windows/Fedora.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -117,7 +124,60 @@ function Test-BrewCask {
 Write-Step 'Validating host'
 
 if (-not $IsMacOS) {
-    throw 'This stack targets macOS. Detected a non-macOS host.'
+    if ($InstallLmStudio -or $AtLogin -or $NoEnvironment) {
+        throw '-InstallLmStudio, -AtLogin, and -NoEnvironment are macOS-only options. See docs/windows-fedora.md.'
+    }
+    if ($IsWindows) {
+        if (Resolve-OllamaCommand) {
+            Write-Skip 'Ollama CLI already available; leaving the existing installation alone'
+        }
+        else {
+            $null = Get-Command winget -ErrorAction Stop
+            if ($PSCmdlet.ShouldProcess('Ollama.Ollama', 'winget install --id Ollama.Ollama --exact --source winget')) {
+                & winget install --id Ollama.Ollama --exact --source winget
+                if ($LASTEXITCODE -ne 0) { throw "WinGet installation failed with exit code $LASTEXITCODE." }
+                if (-not (Resolve-OllamaCommand)) {
+                    throw 'WinGet completed, but the Ollama CLI was not found. Reopen PowerShell to refresh PATH, then rerun this script.'
+                }
+                Write-Ok 'Ollama installed'
+            }
+            elseif (-not $WhatIfPreference) { return }
+        }
+        if (-not $SkipService -and -not $WhatIfPreference) {
+            $version = Get-OllamaVersion -BaseUrl $script:OllamaBaseUrl
+            if ($version) { Write-Ok "server up (v$version)" }
+            else { Write-Warning 'Server readiness is not verified. Open Ollama from the Start menu, then run Test-LocalStack.ps1 after syncing models.' }
+        }
+        Write-Detail 'Start/restart/quit using the native Ollama app. Its installer owns startup behavior; no repo-managed service or tuning was created.'
+    }
+    elseif ($IsLinux) {
+        . "$PSScriptRoot/_fedora.ps1"
+        Assert-FedoraHost
+        if (Test-FedoraOllamaPackage) {
+            Write-Skip 'Fedora ollama package installed'
+        }
+        elseif (Resolve-OllamaCommand) {
+            throw 'An Ollama CLI exists outside the Fedora ollama package. Keep using that installation or remove it manually before installing the RPM.'
+        }
+        elseif ($PSCmdlet.ShouldProcess('ollama', 'dnf install ollama (sudo when needed)')) {
+            Invoke-FedoraCommand -Command dnf -ArgumentList @('install', 'ollama')
+            if (-not (Test-FedoraOllamaPackage)) { throw 'DNF completed, but the ollama package is not installed.' }
+            Write-Ok 'Ollama installed'
+        }
+        elseif (-not $WhatIfPreference) { return }
+        if (-not $SkipService) {
+            & "$PSScriptRoot/Start-Ollama.ps1" -TimeoutSeconds $TimeoutSeconds -BaseUrl $script:OllamaBaseUrl
+        }
+    }
+    else { throw 'Supported installation hosts are macOS, Windows, and Fedora 42+.' }
+
+    Write-Host ''
+    Write-Step 'Next steps (after the native server is running):'
+    Write-Detail './scripts/Sync-Models.ps1 -Tier minimal'
+    Write-Detail "./scripts/Test-LocalStack.ps1 -Model 'gemma4:e4b'"
+    Write-Detail "After checks pass: ./scripts/Start-LocalCopilot.ps1 -Model 'gemma4:e4b'"
+    Write-Detail 'The shared model catalog and Mac default are unchanged. See docs/windows-fedora.md.'
+    return
 }
 
 $arch = (& uname -m).Trim()

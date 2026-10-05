@@ -1,10 +1,13 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Restarts the Ollama service, re-applying the performance knobs. This is how you change
-    a setting on a server that is already running.
+    Restarts the Ollama service. On macOS, also re-applies the saved performance knobs.
 
 .DESCRIPTION
+    On Fedora 42+, restarts the packaged systemd service, preserving native settings
+    and boot policy. On Windows, quit/reopen the native Ollama app instead. The tuning
+    and -AtLogin options below apply only to macOS.
+
     Implemented as stop + `brew services run`, deliberately NOT `brew services restart` -
     restart registers a launchd login item as a side effect, which is a surprising thing
     for a restart to do. Pass -AtLogin if you actually want that.

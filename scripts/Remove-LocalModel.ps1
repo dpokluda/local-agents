@@ -7,8 +7,9 @@
     Unloads the model if it is resident, then deletes it through the API
     (DELETE /api/delete), so this works whether or not the `ollama` CLI is on PATH.
 
-    Disk space is measured, not estimated: the models directory is sized with `du`
-    before and after each delete. That matters because Ollama stores weights as
+    On a local Mac, the models directory is sized with `du` before and after each delete.
+    Other platforms and remote endpoints report reclaimed space as unknown, not as a
+    measurement of the client's filesystem. That matters because Ollama stores weights as
     content-addressed blobs shared between tags. A tag listed at 17GB may free far less
     if another installed tag shares its base layers - and occasionally frees nothing at
     all. The listed size is an upper bound, never a promise.
@@ -75,9 +76,14 @@ begin {
 
     $script:Ready = Test-OllamaReachable -BaseUrl $BaseUrl
     if ($script:Ready) {
-        $script:ModelsPath = Get-OllamaModelsPath
+        $script:ModelsPath = Get-OllamaModelsPath -BaseUrl $BaseUrl
         $script:StartBytes = Get-DirectorySizeBytes -Path $script:ModelsPath
-        Write-Host "Models directory: $script:ModelsPath  ($(Format-ByteSize -Bytes $script:StartBytes))" -ForegroundColor DarkGray
+        if ($script:ModelsPath) {
+            Write-Host "Models directory: $script:ModelsPath  ($(Format-ByteSize -Bytes $script:StartBytes))" -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host 'Server-side disk accounting unavailable; model deletion still uses the selected API.' -ForegroundColor DarkGray
+        }
         Write-Host ''
     }
 
@@ -96,6 +102,7 @@ begin {
 
     $script:Removed = @()
     $script:ReclaimedTotal = 0L
+    $script:ReclaimedKnown = $true
     $script:SyncWarn = @()
 }
 
@@ -170,7 +177,8 @@ process {
             $freed = if ($null -ne $before -and $null -ne $after) { [long]($before - $after) } else { $null }
 
             if ($null -eq $freed) {
-                Write-Host "  removed $tag  (could not measure $script:ModelsPath)" -ForegroundColor Green
+                $script:ReclaimedKnown = $false
+                Write-Host "  removed $tag  (reclaimed disk space unknown)" -ForegroundColor Green
             }
             else {
                 $script:ReclaimedTotal += $freed
@@ -203,7 +211,8 @@ end {
 
     $endBytes = Get-DirectorySizeBytes -Path $script:ModelsPath
     Write-Host "Removed $($script:Removed.Count) model(s): $($script:Removed -join ', ')" -ForegroundColor White
-    Write-Host "Reclaimed: $(Format-ByteSize -Bytes $script:ReclaimedTotal)" -ForegroundColor Green
+    $reclaimed = if ($script:ReclaimedKnown) { Format-ByteSize -Bytes $script:ReclaimedTotal } else { 'unknown' }
+    Write-Host "Reclaimed: $reclaimed" -ForegroundColor Green
     if ($null -ne $script:StartBytes -and $null -ne $endBytes) {
         Write-Host "Models directory: $(Format-ByteSize -Bytes $script:StartBytes) -> $(Format-ByteSize -Bytes $endBytes)" -ForegroundColor DarkGray
     }

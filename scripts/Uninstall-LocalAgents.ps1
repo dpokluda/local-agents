@@ -6,7 +6,13 @@
 .DESCRIPTION
     Destructive by nature, so every step supports -WhatIf and prompts by default.
 
-    Steps:
+    On Windows, quit the tray app first; removes Ollama with WinGet. On Fedora 42+,
+    stops the packaged service and removes the RPM with DNF. These paths do not request
+    model deletion. Windows uses silent uninstall to avoid the vendor's preselected
+    model-removal checkbox. Use Remove-LocalModel.ps1 while the server is running to delete
+    unwanted models before uninstalling. -RemoveLmStudio is macOS-only.
+
+    macOS steps:
       1. Stop the ollama background service.
       2. Uninstall the ollama formula.
       3. Optionally uninstall the LM Studio cask.
@@ -17,7 +23,7 @@
     does not have to re-download everything.
 
 .PARAMETER KeepModels
-    Leave ~/.ollama in place. The software is removed but the downloaded weights stay.
+    On macOS, leave ~/.ollama in place. Windows/Fedora do not request model deletion.
 
 .PARAMETER RemoveLmStudio
     Also uninstall the LM Studio cask if present.
@@ -53,14 +59,45 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/_common.ps1"
-if (-not $IsMacOS) { throw 'This uninstaller only manages the macOS Homebrew installation.' }
-$savedEnvironment = Get-SavedOllamaEnvironment
-$baseUrl = $LocalAgentDefaults.BaseUrl
-if ($savedEnvironment.Contains('OLLAMA_HOST')) { $baseUrl = $savedEnvironment['OLLAMA_HOST'] }
 
 if ($Force -and -not $PSBoundParameters.ContainsKey('Confirm')) {
     $ConfirmPreference = 'None'
 }
+
+if (-not $IsMacOS) {
+    if ($RemoveLmStudio) { throw '-RemoveLmStudio is macOS-only; manage the native GUI separately.' }
+    Write-Detail 'No model deletion is requested on Windows/Fedora, regardless of -KeepModels. Native app settings/logs may be removed.'
+    if ($IsWindows) {
+        $null = Get-Command winget -ErrorAction Stop
+        if ($PSCmdlet.ShouldProcess('Ollama.Ollama', 'winget uninstall --id Ollama.Ollama --exact --silent (no model deletion requested)')) {
+            if (Get-OllamaVersion -BaseUrl (Resolve-LocalAgentBaseUrl)) {
+                throw 'Quit the Ollama tray app/server before uninstalling. No processes were killed.'
+            }
+            & winget uninstall --id Ollama.Ollama --exact --silent
+            if ($LASTEXITCODE -ne 0) { throw "WinGet uninstall failed with exit code $LASTEXITCODE." }
+            Write-Ok 'Ollama uninstalled; no model deletion was requested'
+        }
+    }
+    else {
+        . "$PSScriptRoot/_fedora.ps1"
+        Assert-FedoraHost
+        if (-not (Test-FedoraOllamaPackage)) {
+            Write-Detail 'Fedora ollama package is not installed; no changes made.'
+            return
+        }
+        if ($PSCmdlet.ShouldProcess('ollama', 'Stop ollama.service and dnf remove ollama (keep model data)')) {
+            Invoke-FedoraOllamaService -Action stop -BaseUrl (Resolve-LocalAgentBaseUrl) -Confirm:$false
+            Invoke-FedoraCommand -Command dnf -ArgumentList @('remove', 'ollama')
+            if (Test-FedoraOllamaPackage) { throw 'DNF completed, but the ollama package is still installed.' }
+            Write-Ok 'Ollama uninstalled; model data was not deleted by this script'
+        }
+    }
+    return
+}
+
+$savedEnvironment = Get-SavedOllamaEnvironment
+$baseUrl = $LocalAgentDefaults.BaseUrl
+if ($savedEnvironment.Contains('OLLAMA_HOST')) { $baseUrl = $savedEnvironment['OLLAMA_HOST'] }
 
 function Write-Step {
     param([Parameter(Mandatory)][string]$Message)
