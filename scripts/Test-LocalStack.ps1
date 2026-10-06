@@ -242,7 +242,10 @@ function Invoke-Benchmark {
         messages   = @(@{ role = 'user'; content = $BenchmarkPrompt })
         options    = @{ temperature = 0; num_predict = 128 }
     }
-    if ($KeepAliveValue) { $body.keep_alive = $KeepAliveValue }
+    # Ollama rejects a quoted bare integer here ('-1' -> 400 missing unit in duration),
+    # though it is the correct form for OLLAMA_KEEP_ALIVE. Coerce to the body's type.
+    $keepAliveJson = ConvertTo-OllamaKeepAlive -KeepAlive $KeepAliveValue
+    if ($null -ne $keepAliveJson) { $body.keep_alive = $keepAliveJson }
     $body = $body | ConvertTo-Json -Depth 10
 
     $response = Invoke-RestMethod -Uri "$Uri/api/chat" -Method Post -Body $body `
@@ -285,7 +288,10 @@ function Invoke-NativeToolCheck {
         )
         options    = @{ temperature = 0 }
     }
-    if ($KeepAliveValue) { $body.keep_alive = $KeepAliveValue }
+    # Ollama rejects a quoted bare integer here ('-1' -> 400 missing unit in duration),
+    # though it is the correct form for OLLAMA_KEEP_ALIVE. Coerce to the body's type.
+    $keepAliveJson = ConvertTo-OllamaKeepAlive -KeepAlive $KeepAliveValue
+    if ($null -ne $keepAliveJson) { $body.keep_alive = $keepAliveJson }
     $body = $body | ConvertTo-Json -Depth 20
 
     $response = Invoke-RestMethod -Uri "$Uri/api/chat" -Method Post -Body $body `

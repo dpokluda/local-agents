@@ -468,6 +468,45 @@ function Invoke-OllamaUnload {
     }
 }
 
+function ConvertTo-OllamaKeepAlive {
+    <#
+        .SYNOPSIS
+            Coerces a keep-alive setting into the JSON type Ollama's request API expects.
+
+        .DESCRIPTION
+            Ollama accepts keep_alive in a request body as either a number (seconds, with
+            -1 meaning "never unload") or a duration *string* ("10m", "1h"). It does not
+            accept a bare integer wrapped in quotes: a string goes through Go's duration
+            parser, which demands a unit, so "-1" fails with
+
+                time: missing unit in duration "-1"
+
+            while -1 and "-1s" both succeed.
+
+            This bites because OLLAMA_KEEP_ALIVE='-1' is perfectly valid as an environment
+            variable - the env var and the request body take different formats for the
+            same concept. Reading the saved service setting and posting it straight into a
+            body therefore turns a correct configuration into an HTTP 400.
+
+            So: anything that looks like a plain integer is emitted as a JSON number,
+            and everything else ('1h', '10m', '-1s') stays a string.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()][AllowEmptyString()]$KeepAlive)
+
+    if ($null -eq $KeepAlive) { return $null }
+
+    $text = ([string]$KeepAlive).Trim()
+    if ([string]::IsNullOrEmpty($text)) { return $null }
+
+    if ($text -match '^-?\d+$') {
+        $parsed = 0
+        if ([int]::TryParse($text, [ref]$parsed)) { return $parsed }
+    }
+
+    return $text
+}
+
 function Get-ResidentOllamaModel {
     <#
         .SYNOPSIS

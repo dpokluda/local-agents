@@ -184,6 +184,64 @@ Describe 'Streaming and tool schemas' {
     }
 }
 
+Describe 'Keep-alive request encoding' {
+    It 'returns an integer for <Value>' -ForEach @(
+        @{ Value = '-1'; Expected = -1 }
+        @{ Value = '0'; Expected = 0 }
+        @{ Value = '300'; Expected = 300 }
+    ) {
+        $result = ConvertTo-OllamaKeepAlive -KeepAlive $Value
+        $result | Should -BeOfType ([int])
+        $result | Should -Be $Expected
+    }
+    It 'keeps <Value> as a duration string' -ForEach @(
+        @{ Value = '1h' }
+        @{ Value = '10m' }
+        @{ Value = '-1s' }
+        @{ Value = '1.5' }
+    ) {
+        $result = ConvertTo-OllamaKeepAlive -KeepAlive $Value
+        $result | Should -BeOfType ([string])
+        $result | Should -Be $Value
+    }
+    It 'treats empty input as unset' {
+        ConvertTo-OllamaKeepAlive -KeepAlive '' | Should -BeNullOrEmpty
+        ConvertTo-OllamaKeepAlive -KeepAlive $null | Should -BeNullOrEmpty
+    }
+    It 'serializes -1 as an unquoted JSON number' {
+        # Ollama parses a quoted integer as a Go duration and returns
+        # 400 time: missing unit in duration "-1". The number form is what works.
+        $body = @{ keep_alive = (ConvertTo-OllamaKeepAlive -KeepAlive '-1') } | ConvertTo-Json -Compress
+        $body | Should -BeLike '*"keep_alive":-1*'
+        $body | Should -Not -BeLike '*"keep_alive":"-1"*'
+    }
+    It 'serializes a duration as a quoted JSON string' {
+        $body = @{ keep_alive = (ConvertTo-OllamaKeepAlive -KeepAlive '1h') } | ConvertTo-Json -Compress
+        $body | Should -BeLike '*"keep_alive":"1h"*'
+    }
+    It 'sends the saved -1 setting as a number in a real request body' {
+        Set-Variable IsMacOS -Value $true -Force
+        Set-Variable IsWindows -Value $false -Force
+        Set-Variable IsLinux -Value $false -Force
+        Mock Get-SavedOllamaEnvironment { [ordered]@{ OLLAMA_KEEP_ALIVE = '-1' } }
+        Mock Get-OllamaServerEnvironment { @{ Source = 'none'; Values = [ordered]@{} } }
+        $state = @{ Raw = $null }
+        Mock Invoke-RestMethod {
+            if ($Uri -like '*/api/version') { return [pscustomobject]@{ version = 'test' } }
+            if ($Uri -like '*/api/tags') { return [pscustomobject]@{ models = @([pscustomobject]@{ name = 'test:latest'; size = 100 }) } }
+            $state.Raw = $Body
+            [pscustomobject]@{ eval_count = 50; eval_duration = 1000000000 }
+        }
+        & "$repo/scripts/Test-LocalStack.ps1" -SkipToolCheck -BaseUrl 'http://localhost:11434'
+        $LASTEXITCODE | Should -Be 0
+        $state.Raw | Should -Not -BeNullOrEmpty
+        # Assert on the raw JSON text: ConvertFrom-Json would erase the quoting
+        # distinction that caused the 400.
+        ($state.Raw -replace '\s', '') | Should -BeLike '*"keep_alive":-1*'
+        ($state.Raw | ConvertFrom-Json).keep_alive | Should -Be -1
+    }
+}
+
 Describe 'Readiness exit status' {
     BeforeEach {
         Mock Invoke-RestMethod {
